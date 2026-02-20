@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
-    path::PathBuf,
+    fs,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -45,6 +46,7 @@ const ROOM_MESSAGE_EVENT_TYPE: &str = "m.room.message";
 const ROOM_REDACTION_EVENT_TYPE: &str = "m.room.redaction";
 const REL_TYPE_REPLACE: &str = "m.replace";
 const DEFAULT_TIMELINE_MAX_ITEMS: usize = 500;
+const STORE_PASSPHRASE_FILENAME: &str = ".pikachat-store-passphrase";
 
 #[derive(Debug, Clone)]
 pub struct MatrixBackendConfig {
@@ -602,6 +604,7 @@ impl MatrixFrontendAdapter {
                                         apply_timeline_ops_lenient(buffer, ops);
                                         buffer.items().to_vec()
                                     };
+                                    // Snapshot emission is an adapter-level concern; runtime stays delta-only.
                                     let _ = event_tx_clone.send(event.clone());
                                     let _ = event_tx_clone.send(BackendEvent::RoomTimelineSnapshot {
                                         room_id: room_id.clone(),
@@ -882,7 +885,8 @@ impl MatrixRuntime {
             backend_override
         } else {
             let passphrase_account = store_passphrase_account_for_homeserver(&homeserver);
-            let store_passphrase = self.get_or_create_store_passphrase(&passphrase_account)?;
+            let store_passphrase =
+                self.get_or_create_store_passphrase(&passphrase_account, &data_dir)?;
             let backend: Arc<dyn RuntimeBackend> = Arc::new(
                 MatrixBackend::new(MatrixBackendConfig::new(
                     homeserver.clone(),
@@ -1295,17 +1299,29 @@ impl MatrixRuntime {
         })
     }
 
-    fn get_or_create_store_passphrase(&self, account: &str) -> Result<String, BackendError> {
+    fn get_or_create_store_passphrase(
+        &self,
+        account: &str,
+        data_dir: &Path,
+    ) -> Result<String, BackendError> {
+        let file_path = store_passphrase_file_path(data_dir);
+        if let Some(from_file) = load_store_passphrase_from_file(&file_path)? {
+            return Ok(from_file);
+        }
+
         match self.keyring.get(account) {
-            Ok(passphrase) => Ok(passphrase),
-            Err(SecretStoreError::NotFound) => {
+            Ok(passphrase) => {
+                persist_store_passphrase_to_file(&file_path, &passphrase)?;
+                Ok(passphrase)
+            }
+            Err(SecretStoreError::NotFound)
+            | Err(SecretStoreError::Unavailable(_))
+            | Err(SecretStoreError::Backend(_)) => {
                 let generated = format!("pikachat-store-{}", Uuid::new_v4());
-                self.keyring
-                    .set(account, &generated)
-                    .map_err(|err| map_secret_store_error("set_store_passphrase", account, err))?;
+                let _ = self.keyring.set(account, &generated);
+                persist_store_passphrase_to_file(&file_path, &generated)?;
                 Ok(generated)
             }
-            Err(err) => Err(map_secret_store_error("get_store_passphrase", account, err)),
         }
     }
 
@@ -1420,6 +1436,58 @@ fn store_passphrase_account_for_homeserver(homeserver: &str) -> String {
 
 fn session_account_for_homeserver(homeserver: &str) -> String {
     format!("{SESSION_KEY_PREFIX}:{homeserver}")
+}
+
+fn store_passphrase_file_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(STORE_PASSPHRASE_FILENAME)
+}
+
+fn load_store_passphrase_from_file(path: &Path) -> Result<Option<String>, BackendError> {
+    match fs::read_to_string(path) {
+        Ok(raw) => {
+            let trimmed = raw.trim().to_owned();
+            if trimmed.is_empty() {
+                return Err(BackendError::new(
+                    BackendErrorCategory::Storage,
+                    "store_passphrase_file_empty",
+                    format!("store passphrase file is empty: {}", path.display()),
+                ));
+            }
+            Ok(Some(trimmed))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(BackendError::new(
+            BackendErrorCategory::Storage,
+            "store_passphrase_file_read_error",
+            format!(
+                "failed reading store passphrase file {}: {err}",
+                path.display()
+            ),
+        )),
+    }
+}
+
+fn persist_store_passphrase_to_file(path: &Path, passphrase: &str) -> Result<(), BackendError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| {
+            BackendError::new(
+                BackendErrorCategory::Storage,
+                "store_passphrase_file_write_error",
+                format!("failed creating data dir {}: {err}", parent.display()),
+            )
+        })?;
+    }
+
+    fs::write(path, passphrase).map_err(|err| {
+        BackendError::new(
+            BackendErrorCategory::Storage,
+            "store_passphrase_file_write_error",
+            format!(
+                "failed writing store passphrase file {}: {err}",
+                path.display()
+            ),
+        )
+    })
 }
 
 fn runtime_tuning_from_init_config(
@@ -1781,7 +1849,7 @@ mod tests {
         SessionMeta, SessionTokens,
         ruma::{device_id, events::AnySyncTimelineEvent, serde::Raw, user_id},
     };
-    use std::{env, path::PathBuf, sync::Mutex, time::Duration};
+    use std::{env, fs, path::PathBuf, sync::Mutex, time::Duration};
     use tokio::sync::broadcast;
     use tokio::time::timeout;
 
@@ -1882,8 +1950,15 @@ mod tests {
         }
     }
 
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        env::temp_dir().join(format!("pikachat-{prefix}-{}", Uuid::new_v4()))
+    }
+
     struct MockRuntimeBackend {
         calls: Mutex<Vec<String>>,
+        start_sync_timeouts: Mutex<Vec<Option<Duration>>>,
+        open_room_limits: Mutex<Vec<u16>>,
+        paginate_back_limits: Mutex<Vec<u16>>,
         rooms: Vec<RoomSummary>,
         login_result: Result<(), BackendError>,
         start_sync_result: Result<(), BackendError>,
@@ -1897,6 +1972,9 @@ mod tests {
         fn new(rooms: Vec<RoomSummary>) -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
+                start_sync_timeouts: Mutex::new(Vec::new()),
+                open_room_limits: Mutex::new(Vec::new()),
+                paginate_back_limits: Mutex::new(Vec::new()),
                 rooms,
                 login_result: Ok(()),
                 start_sync_result: Ok(()),
@@ -1916,6 +1994,27 @@ mod tests {
 
         fn calls_snapshot(&self) -> Vec<String> {
             self.calls.lock().expect("call log lock").clone()
+        }
+
+        fn start_sync_timeouts_snapshot(&self) -> Vec<Option<Duration>> {
+            self.start_sync_timeouts
+                .lock()
+                .expect("start-sync-timeouts lock")
+                .clone()
+        }
+
+        fn open_room_limits_snapshot(&self) -> Vec<u16> {
+            self.open_room_limits
+                .lock()
+                .expect("open-room-limits lock")
+                .clone()
+        }
+
+        fn paginate_back_limits_snapshot(&self) -> Vec<u16> {
+            self.paginate_back_limits
+                .lock()
+                .expect("paginate-back-limits lock")
+                .clone()
         }
 
         fn with_login_result(mut self, login_result: Result<(), BackendError>) -> Self {
@@ -1979,9 +2078,13 @@ mod tests {
         async fn start_sync(
             &self,
             _event_tx: broadcast::Sender<BackendEvent>,
-            _sync_request_timeout: Option<Duration>,
+            sync_request_timeout: Option<Duration>,
         ) -> Result<(), BackendError> {
             self.record_call("start_sync");
+            self.start_sync_timeouts
+                .lock()
+                .expect("start-sync-timeouts lock")
+                .push(sync_request_timeout);
             self.start_sync_result.clone()
         }
 
@@ -2023,9 +2126,13 @@ mod tests {
         async fn open_room(
             &self,
             _room_id: &str,
-            _limit: u16,
+            limit: u16,
         ) -> Result<(Vec<TimelineOp>, Option<String>), BackendError> {
             self.record_call("open_room");
+            self.open_room_limits
+                .lock()
+                .expect("open-room-limits lock")
+                .push(limit);
             self.open_room_result.clone()
         }
 
@@ -2033,9 +2140,13 @@ mod tests {
             &self,
             _room_id: &str,
             _from_token: Option<&str>,
-            _limit: u16,
+            limit: u16,
         ) -> Result<(Vec<TimelineOp>, Option<String>), BackendError> {
             self.record_call("paginate_back");
+            self.paginate_back_limits
+                .lock()
+                .expect("paginate-back-limits lock")
+                .push(limit);
             Ok((Vec::new(), None))
         }
 
@@ -2167,6 +2278,44 @@ mod tests {
     }
 
     #[test]
+    fn store_passphrase_file_roundtrip_trims_trailing_whitespace() {
+        let data_dir = unique_temp_dir("passphrase-roundtrip");
+        let path = store_passphrase_file_path(&data_dir);
+
+        persist_store_passphrase_to_file(&path, "passphrase-value\n")
+            .expect("persist passphrase file should work");
+        let loaded =
+            load_store_passphrase_from_file(&path).expect("loading passphrase file should work");
+        assert_eq!(loaded.as_deref(), Some("passphrase-value"));
+
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
+    fn store_passphrase_file_missing_returns_none() {
+        let data_dir = unique_temp_dir("passphrase-missing");
+        let path = store_passphrase_file_path(&data_dir);
+
+        let loaded = load_store_passphrase_from_file(&path)
+            .expect("missing passphrase file should not fail");
+        assert_eq!(loaded, None);
+    }
+
+    #[test]
+    fn store_passphrase_file_empty_returns_storage_error() {
+        let data_dir = unique_temp_dir("passphrase-empty");
+        let path = store_passphrase_file_path(&data_dir);
+        fs::create_dir_all(&data_dir).expect("test data dir should be creatable");
+        fs::write(&path, "\n").expect("test file should be writable");
+
+        let err = load_store_passphrase_from_file(&path)
+            .expect_err("empty passphrase file must fail with storage error");
+        assert_eq!(err.code, "store_passphrase_file_empty");
+
+        let _ = fs::remove_dir_all(&data_dir);
+    }
+
+    #[test]
     fn runtime_tuning_defaults_when_init_config_is_absent() {
         let tuning = runtime_tuning_from_init_config(None).expect("defaults should apply");
         assert_eq!(tuning.sync_request_timeout, None);
@@ -2226,6 +2375,267 @@ mod tests {
         let policy = RetryPolicy::default();
         let delay = policy.delay_for_attempt(0, err.retry_after_ms);
         assert_eq!(delay, Duration::from_secs(7));
+    }
+
+    #[tokio::test]
+    async fn runtime_init_config_applies_sync_request_timeout_to_start_sync() {
+        let mock_backend = Arc::new(MockRuntimeBackend::new(Vec::new()));
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: Some(BackendInitConfig {
+                    sync_request_timeout_ms: Some(12_345),
+                    default_open_room_limit: None,
+                    pagination_limit_cap: None,
+                }),
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::LoginPassword {
+                user_id_or_localpart: "@mock:example.org".to_owned(),
+                password: "password".to_owned(),
+            })
+            .await
+            .expect("login should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { success: true, .. })
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::StartSync)
+            .await
+            .expect("start sync should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Syncing
+                }
+            )
+        })
+        .await;
+
+        assert_eq!(
+            mock_backend.start_sync_timeouts_snapshot(),
+            vec![Some(Duration::from_millis(12_345))]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_init_config_applies_open_room_limit() {
+        let room_id = "!room:example.org".to_owned();
+        let mock_backend = Arc::new(
+            MockRuntimeBackend::new(Vec::new()).with_open_room_result(Ok((
+                vec![TimelineOp::Append(make_timeline_item(
+                    "$event:example.org",
+                    "hello",
+                ))],
+                None,
+            ))),
+        );
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: Some(BackendInitConfig {
+                    sync_request_timeout_ms: None,
+                    default_open_room_limit: Some(7),
+                    pagination_limit_cap: None,
+                }),
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::LoginPassword {
+                user_id_or_localpart: "@mock:example.org".to_owned(),
+                password: "password".to_owned(),
+            })
+            .await
+            .expect("login should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { success: true, .. })
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::OpenRoom {
+                room_id: room_id.clone(),
+            })
+            .await
+            .expect("open room should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::RoomTimelineDelta {
+                    room_id: candidate_room_id,
+                    ..
+                } if candidate_room_id == &room_id
+            )
+        })
+        .await;
+
+        assert_eq!(mock_backend.open_room_limits_snapshot(), vec![7]);
+    }
+
+    #[tokio::test]
+    async fn runtime_init_config_applies_pagination_limit_cap() {
+        let room_id = "!room:example.org".to_owned();
+        let mock_backend = Arc::new(MockRuntimeBackend::new(Vec::new()));
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: Some(BackendInitConfig {
+                    sync_request_timeout_ms: None,
+                    default_open_room_limit: None,
+                    pagination_limit_cap: Some(12),
+                }),
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::LoginPassword {
+                user_id_or_localpart: "@mock:example.org".to_owned(),
+                password: "password".to_owned(),
+            })
+            .await
+            .expect("login should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { success: true, .. })
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::PaginateBack {
+                room_id,
+                limit: 200,
+            })
+            .await
+            .expect("paginate should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::RoomTimelineDelta { .. })
+        })
+        .await;
+
+        assert_eq!(mock_backend.paginate_back_limits_snapshot(), vec![12]);
+    }
+
+    #[tokio::test]
+    async fn runtime_emits_timeline_deltas_without_snapshots() {
+        let room_id = "!room:example.org".to_owned();
+        let mock_backend = Arc::new(
+            MockRuntimeBackend::new(Vec::new()).with_open_room_result(Ok((
+                vec![TimelineOp::Append(make_timeline_item(
+                    "$event:example.org",
+                    "hello",
+                ))],
+                None,
+            ))),
+        );
+        let handle = spawn_runtime_with_backend(mock_backend);
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: None,
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::LoginPassword {
+                user_id_or_localpart: "@mock:example.org".to_owned(),
+                password: "password".to_owned(),
+            })
+            .await
+            .expect("login should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { success: true, .. })
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::OpenRoom {
+                room_id: room_id.clone(),
+            })
+            .await
+            .expect("open room should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::RoomTimelineDelta {
+                    room_id: candidate_room_id,
+                    ..
+                } if candidate_room_id == &room_id
+            )
+        })
+        .await;
+
+        loop {
+            match timeout(Duration::from_millis(100), events.recv()).await {
+                Ok(Ok(event)) => {
+                    assert!(
+                        !matches!(event, BackendEvent::RoomTimelineSnapshot { .. }),
+                        "runtime must remain delta-only; snapshots are adapter-level events"
+                    );
+                }
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => break,
+            }
+        }
     }
 
     #[tokio::test]
@@ -2937,6 +3347,66 @@ mod tests {
 
         assert!(adapter.timeline_snapshot(&room_id).is_empty());
         assert_eq!(adapter.timeline_max_items(), 32);
+
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn frontend_adapter_truncates_snapshot_to_timeline_max_items() {
+        let room_id = "!room:example.org".to_owned();
+        let open_room_ops = (1..=5)
+            .map(|idx| {
+                let event_id = format!("$event-{idx}:example.org");
+                let body = format!("body {idx}");
+                TimelineOp::Append(make_timeline_item(&event_id, &body))
+            })
+            .collect::<Vec<_>>();
+        let mock_backend = Arc::new(
+            MockRuntimeBackend::new(Vec::new()).with_open_room_result(Ok((open_room_ops, None))),
+        );
+        let runtime = spawn_runtime_with_backend(mock_backend);
+        let adapter = MatrixFrontendAdapter::with_config(runtime, 64, 2);
+        let mut events = adapter.subscribe();
+
+        adapter.enqueue(BackendCommand::Init {
+            homeserver: "https://matrix.example.org".to_owned(),
+            data_dir: PathBuf::from("./.unused-test-store"),
+            config: None,
+        });
+        adapter.enqueue(BackendCommand::LoginPassword {
+            user_id_or_localpart: "@mock:example.org".to_owned(),
+            password: "password".to_owned(),
+        });
+        adapter.enqueue(BackendCommand::OpenRoom {
+            room_id: room_id.clone(),
+        });
+        adapter.flush_all().await.expect("flush should work");
+
+        let truncated_snapshot = recv_matching_event(&mut events, |event| match event {
+            BackendEvent::RoomTimelineSnapshot { room_id, items } => {
+                room_id == "!room:example.org" && items.len() == 2
+            }
+            _ => false,
+        })
+        .await;
+        match truncated_snapshot {
+            BackendEvent::RoomTimelineSnapshot { items, .. } => {
+                assert_eq!(items[0].event_id.as_deref(), Some("$event-4:example.org"));
+                assert_eq!(items[1].event_id.as_deref(), Some("$event-5:example.org"));
+            }
+            other => panic!("unexpected snapshot event: {other:?}"),
+        }
+
+        let snapshot = adapter.timeline_snapshot(&room_id);
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(
+            snapshot[0].event_id.as_deref(),
+            Some("$event-4:example.org")
+        );
+        assert_eq!(
+            snapshot[1].event_id.as_deref(),
+            Some("$event-5:example.org")
+        );
 
         adapter.shutdown().await;
     }
