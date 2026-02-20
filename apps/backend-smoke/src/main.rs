@@ -7,7 +7,7 @@ use std::{
 use backend_core::{
     BackendCommand, BackendEvent, BackendInitConfig, BackendLifecycleState, EventStream,
 };
-use backend_matrix::spawn_runtime;
+use backend_matrix::{MatrixFrontendAdapter, spawn_runtime};
 use tokio::{sync::broadcast, time::timeout};
 
 const EVENT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -31,129 +31,138 @@ async fn run() -> Result<(), String> {
     let init_config = init_config_from_env()?;
 
     let runtime = spawn_runtime();
-    let mut events = runtime.subscribe();
+    let adapter = MatrixFrontendAdapter::new(runtime);
+    let mut events = adapter.subscribe();
 
-    send_command(
-        &runtime,
-        BackendCommand::Init {
-            homeserver: homeserver.clone(),
-            data_dir,
-            config: init_config,
-        },
-        "Init",
-    )
-    .await?;
-    wait_for_state(&mut events, BackendLifecycleState::Configured, "configured").await?;
-    println!("Runtime initialized for {homeserver}");
-
-    let maybe_user = env::var("PIKACHAT_USER").ok();
-    let maybe_password = env::var("PIKACHAT_PASSWORD").ok();
-
-    if restore_session {
-        send_command(&runtime, BackendCommand::RestoreSession, "RestoreSession").await?;
-        wait_for_auth_success(&mut events, "restore session").await?;
-        println!("Session restored successfully.");
-    } else if let (Some(user), Some(password)) = (maybe_user, maybe_password) {
+    let result: Result<(), String> = async {
         send_command(
-            &runtime,
-            BackendCommand::LoginPassword {
-                user_id_or_localpart: user.clone(),
-                password,
+            &adapter,
+            BackendCommand::Init {
+                homeserver: homeserver.clone(),
+                data_dir,
+                config: init_config,
             },
-            "LoginPassword",
+            "Init",
         )
         .await?;
-        wait_for_auth_success(&mut events, "password login").await?;
-        println!("Login successful for {user}");
-    } else {
-        println!("Set PIKACHAT_USER and PIKACHAT_PASSWORD to run live auth smoke.");
-        println!("Optional: set PIKACHAT_DM_TARGET to send a DM smoke message.");
-        println!("Optional: set PIKACHAT_RESTORE_SESSION=1 to try keyring session restore.");
-        println!("Optional: set PIKACHAT_START_SYNC=1 to exercise StartSync/StopSync.");
-        println!(
-            "Optional sync trace: PIKACHAT_SYNC_VERBOSE=1, PIKACHAT_WATCH_ROOM_ID='!room:example.org'."
-        );
-        println!(
-            "Optional tuning: PIKACHAT_SYNC_REQUEST_TIMEOUT_MS, PIKACHAT_OPEN_ROOM_LIMIT, PIKACHAT_PAGINATION_LIMIT_CAP."
-        );
-        return Ok(());
+        wait_for_state(&mut events, BackendLifecycleState::Configured, "configured").await?;
+        println!("Runtime initialized for {homeserver}");
+
+        let maybe_user = env::var("PIKACHAT_USER").ok();
+        let maybe_password = env::var("PIKACHAT_PASSWORD").ok();
+
+        if restore_session {
+            send_command(&adapter, BackendCommand::RestoreSession, "RestoreSession").await?;
+            wait_for_auth_success(&mut events, "restore session").await?;
+            println!("Session restored successfully.");
+        } else if let (Some(user), Some(password)) = (maybe_user, maybe_password) {
+            send_command(
+                &adapter,
+                BackendCommand::LoginPassword {
+                    user_id_or_localpart: user.clone(),
+                    password,
+                },
+                "LoginPassword",
+            )
+            .await?;
+            wait_for_auth_success(&mut events, "password login").await?;
+            println!("Login successful for {user}");
+        } else {
+            println!("Set PIKACHAT_USER and PIKACHAT_PASSWORD to run live auth smoke.");
+            println!("Optional: set PIKACHAT_DM_TARGET to send a DM smoke message.");
+            println!("Optional: set PIKACHAT_RESTORE_SESSION=1 to try keyring session restore.");
+            println!("Optional: set PIKACHAT_START_SYNC=1 to exercise StartSync/StopSync.");
+            println!(
+                "Optional sync trace: PIKACHAT_SYNC_VERBOSE=1, PIKACHAT_WATCH_ROOM_ID='!room:example.org'."
+            );
+            println!(
+                "Optional tuning: PIKACHAT_SYNC_REQUEST_TIMEOUT_MS, PIKACHAT_OPEN_ROOM_LIMIT, PIKACHAT_PAGINATION_LIMIT_CAP."
+            );
+            return Ok(());
+        }
+
+        send_command(&adapter, BackendCommand::ListRooms, "ListRooms").await?;
+        let rooms = wait_for_room_list(&mut events).await?;
+        println!("Loaded {rooms} rooms from backend.");
+
+        if env_truthy("PIKACHAT_START_SYNC") {
+            send_command(&adapter, BackendCommand::StartSync, "StartSync").await?;
+            wait_for_state(&mut events, BackendLifecycleState::Syncing, "syncing").await?;
+            println!("Sync started.");
+
+            let sync_verbose = env_truthy("PIKACHAT_SYNC_VERBOSE");
+            let watch_room_id = env::var("PIKACHAT_WATCH_ROOM_ID").ok();
+            let observe_secs = env::var("PIKACHAT_SYNC_OBSERVE_SECS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_SYNC_OBSERVE_SECS);
+            let stats = observe_sync_events(
+                &mut events,
+                Duration::from_secs(observe_secs),
+                sync_verbose,
+                watch_room_id.as_deref(),
+            )
+            .await?;
+            println!(
+                "Observed sync for {}s: room_list_updates={}, timeline_deltas={}, append_ops={}, update_ops={}, remove_ops={}, clear_ops={}",
+                observe_secs,
+                stats.room_list_updates,
+                stats.timeline_deltas,
+                stats.append_ops,
+                stats.update_ops,
+                stats.remove_ops,
+                stats.clear_ops
+            );
+
+            send_command(&adapter, BackendCommand::StopSync, "StopSync").await?;
+            wait_for_state(
+                &mut events,
+                BackendLifecycleState::Authenticated,
+                "authenticated after stop sync",
+            )
+            .await?;
+            println!("Sync stopped.");
+        }
+
+        if let Some(dm_target) = env::var("PIKACHAT_DM_TARGET").ok() {
+            let dm_body =
+                env::var("PIKACHAT_DM_BODY").unwrap_or_else(|_| "PikaChat backend smoke test".to_owned());
+            let client_txn_id = format!("smoke-dm-{}", monotonic_nonce());
+
+            send_command(
+                &adapter,
+                BackendCommand::SendDmText {
+                    user_id: dm_target.clone(),
+                    client_txn_id: client_txn_id.clone(),
+                    body: dm_body,
+                },
+                "SendDmText",
+            )
+            .await?;
+
+            let event_id = wait_for_send_ack(&mut events, &client_txn_id).await?;
+            println!("Sent DM to {dm_target} as event {event_id}");
+        }
+
+        Ok(())
     }
+    .await;
 
-    send_command(&runtime, BackendCommand::ListRooms, "ListRooms").await?;
-    let rooms = wait_for_room_list(&mut events).await?;
-    println!("Loaded {rooms} rooms from backend.");
-
-    if env_truthy("PIKACHAT_START_SYNC") {
-        send_command(&runtime, BackendCommand::StartSync, "StartSync").await?;
-        wait_for_state(&mut events, BackendLifecycleState::Syncing, "syncing").await?;
-        println!("Sync started.");
-
-        let sync_verbose = env_truthy("PIKACHAT_SYNC_VERBOSE");
-        let watch_room_id = env::var("PIKACHAT_WATCH_ROOM_ID").ok();
-        let observe_secs = env::var("PIKACHAT_SYNC_OBSERVE_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_SYNC_OBSERVE_SECS);
-        let stats = observe_sync_events(
-            &mut events,
-            Duration::from_secs(observe_secs),
-            sync_verbose,
-            watch_room_id.as_deref(),
-        )
-        .await?;
-        println!(
-            "Observed sync for {}s: room_list_updates={}, timeline_deltas={}, append_ops={}, update_ops={}, remove_ops={}, clear_ops={}",
-            observe_secs,
-            stats.room_list_updates,
-            stats.timeline_deltas,
-            stats.append_ops,
-            stats.update_ops,
-            stats.remove_ops,
-            stats.clear_ops
-        );
-
-        send_command(&runtime, BackendCommand::StopSync, "StopSync").await?;
-        wait_for_state(
-            &mut events,
-            BackendLifecycleState::Authenticated,
-            "authenticated after stop sync",
-        )
-        .await?;
-        println!("Sync stopped.");
-    }
-
-    if let Some(dm_target) = env::var("PIKACHAT_DM_TARGET").ok() {
-        let dm_body = env::var("PIKACHAT_DM_BODY")
-            .unwrap_or_else(|_| "PikaChat backend smoke test".to_owned());
-        let client_txn_id = format!("smoke-dm-{}", monotonic_nonce());
-
-        send_command(
-            &runtime,
-            BackendCommand::SendDmText {
-                user_id: dm_target.clone(),
-                client_txn_id: client_txn_id.clone(),
-                body: dm_body,
-            },
-            "SendDmText",
-        )
-        .await?;
-
-        let event_id = wait_for_send_ack(&mut events, &client_txn_id).await?;
-        println!("Sent DM to {dm_target} as event {event_id}");
-    }
-
-    Ok(())
+    adapter.shutdown().await;
+    result
 }
 
 async fn send_command(
-    runtime: &backend_matrix::MatrixRuntimeHandle,
+    adapter: &MatrixFrontendAdapter,
     command: BackendCommand,
     label: &str,
 ) -> Result<(), String> {
-    runtime
-        .send(command)
+    let command_id = adapter.enqueue(command);
+    adapter
+        .flush_one()
         .await
-        .map_err(|err| format!("failed to enqueue {label}: {err}"))
+        .map_err(|err| format!("failed to flush {label} (id={}): {err}", command_id.value()))?;
+    Ok(())
 }
 
 async fn wait_for_state(
