@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 backend-core = { path = "../backend-core" }
 backend-platform = { path = "../backend-platform", features = ["os-keyring"] }
 matrix-sdk.workspace = true

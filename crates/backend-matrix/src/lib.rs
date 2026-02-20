@@ -1,5 +1,6 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
+use async_trait::async_trait;
 use backend_core::{
     BackendChannelError, BackendChannels, BackendCommand, BackendError, BackendErrorCategory,
     BackendEvent, BackendInitConfig, BackendLifecycleState, BackendStateMachine, EventStream,
@@ -358,6 +359,145 @@ impl MatrixBackend {
     }
 }
 
+#[async_trait]
+trait RuntimeBackend: Send + Sync {
+    fn session(&self) -> Option<MatrixSession>;
+    async fn restore_session(&self, session: MatrixSession) -> Result<(), BackendError>;
+    async fn logout(&self) -> Result<(), BackendError>;
+    fn list_rooms(&self) -> Vec<RoomSummary>;
+    async fn login_password(
+        &self,
+        user_id_or_localpart: &str,
+        password: &str,
+        device_display_name: &str,
+    ) -> Result<(), BackendError>;
+    async fn start_sync(
+        &self,
+        event_tx: broadcast::Sender<BackendEvent>,
+        sync_request_timeout: Option<Duration>,
+    ) -> Result<(), BackendError>;
+    async fn stop_sync(&self) -> Result<(), BackendError>;
+    async fn send_message(
+        &self,
+        room_id: &str,
+        body: &str,
+        msgtype: MessageType,
+    ) -> Result<String, BackendError>;
+    async fn edit_message(
+        &self,
+        room_id: &str,
+        target_event_id: &str,
+        new_body: &str,
+    ) -> Result<String, BackendError>;
+    async fn redact_message(
+        &self,
+        room_id: &str,
+        target_event_id: &str,
+        reason: Option<String>,
+    ) -> Result<(), BackendError>;
+    async fn open_room(
+        &self,
+        room_id: &str,
+        limit: u16,
+    ) -> Result<(Vec<TimelineOp>, Option<String>), BackendError>;
+    async fn paginate_back(
+        &self,
+        room_id: &str,
+        from_token: Option<&str>,
+        limit: u16,
+    ) -> Result<(Vec<TimelineOp>, Option<String>), BackendError>;
+    async fn send_dm_text(&self, user_id: &str, body: &str) -> Result<String, BackendError>;
+}
+
+#[async_trait]
+impl RuntimeBackend for MatrixBackend {
+    fn session(&self) -> Option<MatrixSession> {
+        MatrixBackend::session(self)
+    }
+
+    async fn restore_session(&self, session: MatrixSession) -> Result<(), BackendError> {
+        MatrixBackend::restore_session(self, session).await
+    }
+
+    async fn logout(&self) -> Result<(), BackendError> {
+        MatrixBackend::logout(self).await
+    }
+
+    fn list_rooms(&self) -> Vec<RoomSummary> {
+        MatrixBackend::list_rooms(self)
+    }
+
+    async fn login_password(
+        &self,
+        user_id_or_localpart: &str,
+        password: &str,
+        device_display_name: &str,
+    ) -> Result<(), BackendError> {
+        MatrixBackend::login_password(self, user_id_or_localpart, password, device_display_name)
+            .await
+    }
+
+    async fn start_sync(
+        &self,
+        event_tx: broadcast::Sender<BackendEvent>,
+        sync_request_timeout: Option<Duration>,
+    ) -> Result<(), BackendError> {
+        MatrixBackend::start_sync(self, event_tx, sync_request_timeout).await
+    }
+
+    async fn stop_sync(&self) -> Result<(), BackendError> {
+        MatrixBackend::stop_sync(self).await
+    }
+
+    async fn send_message(
+        &self,
+        room_id: &str,
+        body: &str,
+        msgtype: MessageType,
+    ) -> Result<String, BackendError> {
+        MatrixBackend::send_message(self, room_id, body, msgtype).await
+    }
+
+    async fn edit_message(
+        &self,
+        room_id: &str,
+        target_event_id: &str,
+        new_body: &str,
+    ) -> Result<String, BackendError> {
+        MatrixBackend::edit_message(self, room_id, target_event_id, new_body).await
+    }
+
+    async fn redact_message(
+        &self,
+        room_id: &str,
+        target_event_id: &str,
+        reason: Option<String>,
+    ) -> Result<(), BackendError> {
+        MatrixBackend::redact_message(self, room_id, target_event_id, reason).await
+    }
+
+    async fn open_room(
+        &self,
+        room_id: &str,
+        limit: u16,
+    ) -> Result<(Vec<TimelineOp>, Option<String>), BackendError> {
+        MatrixBackend::open_room(self, room_id, limit).await
+    }
+
+    async fn paginate_back(
+        &self,
+        room_id: &str,
+        from_token: Option<&str>,
+        limit: u16,
+    ) -> Result<(Vec<TimelineOp>, Option<String>), BackendError> {
+        MatrixBackend::paginate_back(self, room_id, from_token, limit).await
+    }
+
+    async fn send_dm_text(&self, user_id: &str, body: &str) -> Result<String, BackendError> {
+        MatrixBackend::send_dm_text(self, user_id, body).await
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MatrixRuntimeHandle {
     channels: BackendChannels,
@@ -376,6 +516,17 @@ impl MatrixRuntimeHandle {
 pub fn spawn_runtime() -> MatrixRuntimeHandle {
     let (channels, command_rx) = BackendChannels::new(128, 512);
     let runtime = MatrixRuntime::new(channels.clone(), command_rx);
+    tokio::spawn(async move {
+        runtime.run().await;
+    });
+
+    MatrixRuntimeHandle { channels }
+}
+
+#[cfg(test)]
+fn spawn_runtime_with_backend(backend: Arc<dyn RuntimeBackend>) -> MatrixRuntimeHandle {
+    let (channels, command_rx) = BackendChannels::new(128, 512);
+    let runtime = MatrixRuntime::new(channels.clone(), command_rx).with_backend_override(backend);
     tokio::spawn(async move {
         runtime.run().await;
     });
@@ -409,7 +560,9 @@ struct MatrixRuntime {
     channels: BackendChannels,
     command_rx: mpsc::Receiver<BackendCommand>,
     state_machine: BackendStateMachine,
-    backend: Option<Arc<MatrixBackend>>,
+    backend: Option<Arc<dyn RuntimeBackend>>,
+    backend_override: Option<Arc<dyn RuntimeBackend>>,
+    disable_session_persistence: bool,
     init_state: Option<RuntimeInitState>,
     runtime_tuning: RuntimeTuning,
     pagination_tokens: HashMap<String, Option<String>>,
@@ -423,11 +576,20 @@ impl MatrixRuntime {
             command_rx,
             state_machine: BackendStateMachine::default(),
             backend: None,
+            backend_override: None,
+            disable_session_persistence: false,
             init_state: None,
             runtime_tuning: RuntimeTuning::default(),
             pagination_tokens: HashMap::new(),
             keyring: ScopedSecretStore::new(OsKeyringSecretStore, KEYRING_SERVICE),
         }
+    }
+
+    #[cfg(test)]
+    fn with_backend_override(mut self, backend: Arc<dyn RuntimeBackend>) -> Self {
+        self.backend_override = Some(backend);
+        self.disable_session_persistence = true;
+        self
     }
 
     async fn run(mut self) {
@@ -525,19 +687,22 @@ impl MatrixRuntime {
         })?;
 
         let runtime_tuning = runtime_tuning_from_init_config(config)?;
-
-        let passphrase_account = store_passphrase_account_for_homeserver(&homeserver);
         let session_account = session_account_for_homeserver(&homeserver);
-        let store_passphrase = self.get_or_create_store_passphrase(&passphrase_account)?;
-
-        let backend = Arc::new(
-            MatrixBackend::new(MatrixBackendConfig::new(
-                homeserver.clone(),
-                data_dir.clone(),
-                Some(store_passphrase),
-            ))
-            .await?,
-        );
+        let backend = if let Some(backend_override) = self.backend_override.clone() {
+            backend_override
+        } else {
+            let passphrase_account = store_passphrase_account_for_homeserver(&homeserver);
+            let store_passphrase = self.get_or_create_store_passphrase(&passphrase_account)?;
+            let backend: Arc<dyn RuntimeBackend> = Arc::new(
+                MatrixBackend::new(MatrixBackendConfig::new(
+                    homeserver.clone(),
+                    data_dir.clone(),
+                    Some(store_passphrase),
+                ))
+                .await?,
+            );
+            backend
+        };
 
         self.backend = Some(backend);
         self.init_state = Some(RuntimeInitState { session_account });
@@ -884,7 +1049,9 @@ impl MatrixRuntime {
 
         backend.logout().await?;
 
-        if let Ok(init_state) = self.require_init_state() {
+        if !self.disable_session_persistence
+            && let Ok(init_state) = self.require_init_state()
+        {
             match self.keyring.delete(&init_state.session_account) {
                 Ok(()) | Err(SecretStoreError::NotFound) => {}
                 Err(err) => {
@@ -918,7 +1085,7 @@ impl MatrixRuntime {
         }
     }
 
-    fn require_backend(&self) -> Result<Arc<MatrixBackend>, BackendError> {
+    fn require_backend(&self) -> Result<Arc<dyn RuntimeBackend>, BackendError> {
         self.backend.clone().ok_or_else(|| {
             BackendError::new(
                 BackendErrorCategory::Config,
@@ -953,6 +1120,10 @@ impl MatrixRuntime {
     }
 
     fn persist_current_session(&self) -> Result<(), BackendError> {
+        if self.disable_session_persistence {
+            return Ok(());
+        }
+
         let backend = self.require_backend()?;
         let init_state = self.require_init_state()?;
 
@@ -978,6 +1149,14 @@ impl MatrixRuntime {
     }
 
     fn load_session(&self, session_account: &str) -> Result<MatrixSession, BackendError> {
+        if self.disable_session_persistence {
+            return Err(BackendError::new(
+                BackendErrorCategory::Auth,
+                "session_not_found",
+                "session restore is unavailable in this runtime configuration",
+            ));
+        }
+
         let raw = self.keyring.get(session_account).map_err(|err| match err {
             SecretStoreError::NotFound => BackendError::new(
                 BackendErrorCategory::Auth,
@@ -1325,8 +1504,13 @@ fn map_client_build_error(err: ClientBuildError) -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use matrix_sdk::ruma::{events::AnySyncTimelineEvent, serde::Raw};
-    use std::{env, time::Duration};
+    use async_trait::async_trait;
+    use matrix_sdk::{
+        SessionMeta, SessionTokens,
+        ruma::{device_id, events::AnySyncTimelineEvent, serde::Raw, user_id},
+    };
+    use std::{env, path::PathBuf, sync::Mutex, time::Duration};
+    use tokio::sync::broadcast;
     use tokio::time::timeout;
 
     fn make_sync_timeline_event(
@@ -1349,6 +1533,160 @@ mod tests {
         let raw = Raw::<AnySyncTimelineEvent>::from_json_string(json.to_string())
             .expect("timeline event json should parse");
         TimelineEvent::from_plaintext(raw)
+    }
+
+    fn mock_session() -> MatrixSession {
+        MatrixSession {
+            meta: SessionMeta {
+                user_id: user_id!("@mock:example.org").to_owned(),
+                device_id: device_id!("MOCKDEVICE").to_owned(),
+            },
+            tokens: SessionTokens {
+                access_token: "mock-access-token".to_owned(),
+                refresh_token: None,
+            },
+        }
+    }
+
+    #[derive(Default)]
+    struct MockRuntimeBackend {
+        calls: Mutex<Vec<String>>,
+        rooms: Vec<RoomSummary>,
+    }
+
+    impl MockRuntimeBackend {
+        fn new(rooms: Vec<RoomSummary>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                rooms,
+            }
+        }
+
+        fn record_call(&self, call: &str) {
+            self.calls
+                .lock()
+                .expect("call log lock")
+                .push(call.to_owned());
+        }
+
+        fn calls_snapshot(&self) -> Vec<String> {
+            self.calls.lock().expect("call log lock").clone()
+        }
+    }
+
+    #[async_trait]
+    impl RuntimeBackend for MockRuntimeBackend {
+        fn session(&self) -> Option<MatrixSession> {
+            Some(mock_session())
+        }
+
+        async fn restore_session(&self, _session: MatrixSession) -> Result<(), BackendError> {
+            self.record_call("restore_session");
+            Ok(())
+        }
+
+        async fn logout(&self) -> Result<(), BackendError> {
+            self.record_call("logout");
+            Ok(())
+        }
+
+        fn list_rooms(&self) -> Vec<RoomSummary> {
+            self.record_call("list_rooms");
+            self.rooms.clone()
+        }
+
+        async fn login_password(
+            &self,
+            _user_id_or_localpart: &str,
+            _password: &str,
+            _device_display_name: &str,
+        ) -> Result<(), BackendError> {
+            self.record_call("login_password");
+            Ok(())
+        }
+
+        async fn start_sync(
+            &self,
+            _event_tx: broadcast::Sender<BackendEvent>,
+            _sync_request_timeout: Option<Duration>,
+        ) -> Result<(), BackendError> {
+            self.record_call("start_sync");
+            Ok(())
+        }
+
+        async fn stop_sync(&self) -> Result<(), BackendError> {
+            self.record_call("stop_sync");
+            Ok(())
+        }
+
+        async fn send_message(
+            &self,
+            _room_id: &str,
+            _body: &str,
+            _msgtype: MessageType,
+        ) -> Result<String, BackendError> {
+            self.record_call("send_message");
+            Ok("$mock-event:example.org".to_owned())
+        }
+
+        async fn edit_message(
+            &self,
+            _room_id: &str,
+            _target_event_id: &str,
+            _new_body: &str,
+        ) -> Result<String, BackendError> {
+            self.record_call("edit_message");
+            Ok("$mock-edit:example.org".to_owned())
+        }
+
+        async fn redact_message(
+            &self,
+            _room_id: &str,
+            _target_event_id: &str,
+            _reason: Option<String>,
+        ) -> Result<(), BackendError> {
+            self.record_call("redact_message");
+            Ok(())
+        }
+
+        async fn open_room(
+            &self,
+            _room_id: &str,
+            _limit: u16,
+        ) -> Result<(Vec<TimelineOp>, Option<String>), BackendError> {
+            self.record_call("open_room");
+            Ok((Vec::new(), None))
+        }
+
+        async fn paginate_back(
+            &self,
+            _room_id: &str,
+            _from_token: Option<&str>,
+            _limit: u16,
+        ) -> Result<(Vec<TimelineOp>, Option<String>), BackendError> {
+            self.record_call("paginate_back");
+            Ok((Vec::new(), None))
+        }
+
+        async fn send_dm_text(&self, _user_id: &str, _body: &str) -> Result<String, BackendError> {
+            self.record_call("send_dm_text");
+            Ok("$mock-dm:example.org".to_owned())
+        }
+    }
+
+    async fn recv_matching_event<F>(events: &mut EventStream, mut predicate: F) -> BackendEvent
+    where
+        F: FnMut(&BackendEvent) -> bool,
+    {
+        loop {
+            let event = timeout(Duration::from_secs(2), events.recv())
+                .await
+                .expect("event timeout")
+                .expect("event receive");
+            if predicate(&event) {
+                return event;
+            }
+        }
     }
 
     #[test]
@@ -1529,6 +1867,112 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_happy_path_login_list_and_send_message_is_deterministic() {
+        let mock_backend = Arc::new(MockRuntimeBackend::new(vec![RoomSummary {
+            room_id: "!room:example.org".to_owned(),
+            name: Some("Mock Room".to_owned()),
+            unread_notifications: 0,
+            highlight_count: 0,
+            is_direct: false,
+        }]));
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: None,
+            })
+            .await
+            .expect("init should enqueue");
+
+        let configured = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+        assert!(matches!(
+            configured,
+            BackendEvent::StateChanged {
+                state: BackendLifecycleState::Configured
+            }
+        ));
+
+        handle
+            .send(BackendCommand::LoginPassword {
+                user_id_or_localpart: "@mock:example.org".to_owned(),
+                password: "password".to_owned(),
+            })
+            .await
+            .expect("login should enqueue");
+
+        let auth_result = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { .. })
+        })
+        .await;
+        match auth_result {
+            BackendEvent::AuthResult {
+                success,
+                error_code,
+            } => {
+                assert!(success);
+                assert_eq!(error_code, None);
+            }
+            other => panic!("unexpected auth event: {other:?}"),
+        }
+
+        handle
+            .send(BackendCommand::ListRooms)
+            .await
+            .expect("list rooms should enqueue");
+
+        let room_list_event = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::RoomListUpdated { .. })
+        })
+        .await;
+        match room_list_event {
+            BackendEvent::RoomListUpdated { rooms } => {
+                assert_eq!(rooms.len(), 1);
+                assert_eq!(rooms[0].room_id, "!room:example.org");
+            }
+            other => panic!("unexpected room list event: {other:?}"),
+        }
+
+        handle
+            .send(BackendCommand::SendMessage {
+                room_id: "!room:example.org".to_owned(),
+                client_txn_id: "txn-1".to_owned(),
+                body: "hello from test".to_owned(),
+                msgtype: MessageType::Text,
+            })
+            .await
+            .expect("send message should enqueue");
+
+        let send_ack = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::SendAck(_))
+        })
+        .await;
+        match send_ack {
+            BackendEvent::SendAck(ack) => {
+                assert_eq!(ack.client_txn_id, "txn-1");
+                assert_eq!(ack.event_id.as_deref(), Some("$mock-event:example.org"));
+                assert_eq!(ack.error_code, None);
+            }
+            other => panic!("unexpected send ack event: {other:?}"),
+        }
+
+        assert_eq!(
+            mock_backend.calls_snapshot(),
+            vec!["login_password", "list_rooms", "send_message"]
+        );
     }
 
     #[tokio::test]

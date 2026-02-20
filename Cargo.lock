@@ -219,6 +219,7 @@ dependencies = [
 name = "backend-matrix"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "backend-core",
  "backend-platform",
  "matrix-sdk",
