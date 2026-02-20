@@ -41,6 +41,11 @@ pub enum BackendCommand {
         room_id: String,
         limit: u16,
     },
+    SendDmText {
+        user_id: String,
+        client_txn_id: String,
+        body: String,
+    },
     SendMessage {
         room_id: String,
         client_txn_id: String,

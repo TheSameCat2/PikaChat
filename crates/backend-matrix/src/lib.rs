@@ -441,6 +441,14 @@ impl MatrixRuntime {
             BackendCommand::PaginateBack { room_id, limit } => {
                 self.handle_paginate_back(room_id, limit).await
             }
+            BackendCommand::SendDmText {
+                user_id,
+                client_txn_id,
+                body,
+            } => {
+                self.handle_send_dm_text(user_id, client_txn_id, body).await;
+                Ok(())
+            }
             BackendCommand::SendMessage {
                 room_id,
                 client_txn_id,
@@ -656,6 +664,41 @@ impl MatrixRuntime {
             .emit(BackendEvent::RoomTimelineDelta { room_id, ops });
 
         Ok(())
+    }
+
+    async fn handle_send_dm_text(&mut self, user_id: String, client_txn_id: String, body: String) {
+        let validation = self.validate_transition(BackendCommand::SendDmText {
+            user_id: String::new(),
+            client_txn_id: String::new(),
+            body: String::new(),
+        });
+
+        if let Err(err) = validation {
+            self.channels.emit(normalize_send_outcome(
+                client_txn_id,
+                SendOutcome::Failure { error: err },
+            ));
+            return;
+        }
+
+        let backend = match self.require_backend() {
+            Ok(backend) => backend,
+            Err(err) => {
+                self.channels.emit(normalize_send_outcome(
+                    client_txn_id,
+                    SendOutcome::Failure { error: err },
+                ));
+                return;
+            }
+        };
+
+        let outcome = match backend.send_dm_text(&user_id, &body).await {
+            Ok(event_id) => SendOutcome::Success { event_id },
+            Err(error) => SendOutcome::Failure { error },
+        };
+
+        self.channels
+            .emit(normalize_send_outcome(client_txn_id, outcome));
     }
 
     async fn handle_send_message(
@@ -1243,6 +1286,35 @@ mod tests {
         match event {
             BackendEvent::FatalError { code, .. } => {
                 assert_eq!(code, "invalid_state_transition");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_send_dm_outside_authenticated_context_emits_send_ack_failure() {
+        let handle = spawn_runtime();
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::SendDmText {
+                user_id: "@alice:example.org".to_owned(),
+                client_txn_id: "tx-dm-1".to_owned(),
+                body: "hello".to_owned(),
+            })
+            .await
+            .expect("command should enqueue");
+
+        let event = timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("event timeout")
+            .expect("event receive");
+
+        match event {
+            BackendEvent::SendAck(ack) => {
+                assert_eq!(ack.client_txn_id, "tx-dm-1");
+                assert_eq!(ack.event_id, None);
+                assert_eq!(ack.error_code.as_deref(), Some("invalid_state_transition"));
             }
             other => panic!("unexpected event: {other:?}"),
         }

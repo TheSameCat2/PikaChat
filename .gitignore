@@ -2,4 +2,6 @@
 **/*.rs.bk
 .DS_Store
 /.pikachat-smoke-store
+/.pikachat-smoke-store-live-*
+/.pikachat-live-test-*
 PLAN.md

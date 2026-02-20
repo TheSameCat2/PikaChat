@@ -57,6 +57,7 @@ impl BackendStateMachine {
             ListRooms
             | OpenRoom { .. }
             | PaginateBack { .. }
+            | SendDmText { .. }
             | SendMessage { .. }
             | EditMessage { .. }
             | RedactMessage { .. } => {
@@ -208,6 +209,15 @@ mod tests {
                 msgtype: MessageType::Text,
             })
             .expect_err("timeline command should fail when not authenticated");
+        assert_eq!(err.code, "invalid_state_transition");
+
+        let err = sm
+            .apply(&BackendCommand::SendDmText {
+                user_id: "@alice:example.org".into(),
+                client_txn_id: "tx-2".into(),
+                body: "hello".into(),
+            })
+            .expect_err("dm command should fail when not authenticated");
         assert_eq!(err.code, "invalid_state_transition");
     }
 }
