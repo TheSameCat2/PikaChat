@@ -1548,10 +1548,12 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct MockRuntimeBackend {
         calls: Mutex<Vec<String>>,
         rooms: Vec<RoomSummary>,
+        login_result: Result<(), BackendError>,
+        send_message_result: Result<String, BackendError>,
+        session: Option<MatrixSession>,
     }
 
     impl MockRuntimeBackend {
@@ -1559,6 +1561,9 @@ mod tests {
             Self {
                 calls: Mutex::new(Vec::new()),
                 rooms,
+                login_result: Ok(()),
+                send_message_result: Ok("$mock-event:example.org".to_owned()),
+                session: Some(mock_session()),
             }
         }
 
@@ -1572,12 +1577,25 @@ mod tests {
         fn calls_snapshot(&self) -> Vec<String> {
             self.calls.lock().expect("call log lock").clone()
         }
+
+        fn with_login_result(mut self, login_result: Result<(), BackendError>) -> Self {
+            self.login_result = login_result;
+            self
+        }
+
+        fn with_send_message_result(
+            mut self,
+            send_message_result: Result<String, BackendError>,
+        ) -> Self {
+            self.send_message_result = send_message_result;
+            self
+        }
     }
 
     #[async_trait]
     impl RuntimeBackend for MockRuntimeBackend {
         fn session(&self) -> Option<MatrixSession> {
-            Some(mock_session())
+            self.session.clone()
         }
 
         async fn restore_session(&self, _session: MatrixSession) -> Result<(), BackendError> {
@@ -1602,7 +1620,7 @@ mod tests {
             _device_display_name: &str,
         ) -> Result<(), BackendError> {
             self.record_call("login_password");
-            Ok(())
+            self.login_result.clone()
         }
 
         async fn start_sync(
@@ -1626,7 +1644,7 @@ mod tests {
             _msgtype: MessageType,
         ) -> Result<String, BackendError> {
             self.record_call("send_message");
-            Ok("$mock-event:example.org".to_owned())
+            self.send_message_result.clone()
         }
 
         async fn edit_message(
@@ -1973,6 +1991,180 @@ mod tests {
             mock_backend.calls_snapshot(),
             vec!["login_password", "list_rooms", "send_message"]
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_login_failure_emits_auth_result_error_code() {
+        let mock_backend = Arc::new(MockRuntimeBackend::new(Vec::new()).with_login_result(Err(
+            BackendError::new(
+                BackendErrorCategory::Auth,
+                "auth_invalid_credentials",
+                "bad credentials",
+            ),
+        )));
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: None,
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::LoginPassword {
+                user_id_or_localpart: "@mock:example.org".to_owned(),
+                password: "wrong-password".to_owned(),
+            })
+            .await
+            .expect("login should enqueue");
+
+        let auth_result = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { .. })
+        })
+        .await;
+        match auth_result {
+            BackendEvent::AuthResult {
+                success,
+                error_code,
+            } => {
+                assert!(!success);
+                assert_eq!(error_code.as_deref(), Some("auth_invalid_credentials"));
+            }
+            other => panic!("unexpected auth result event: {other:?}"),
+        }
+
+        assert_eq!(mock_backend.calls_snapshot(), vec!["login_password"]);
+    }
+
+    #[tokio::test]
+    async fn runtime_send_message_failure_emits_send_ack_error_code() {
+        let mock_backend = Arc::new(
+            MockRuntimeBackend::new(Vec::new()).with_send_message_result(Err(BackendError::new(
+                BackendErrorCategory::Network,
+                "send_network_failure",
+                "network outage",
+            ))),
+        );
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: None,
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::LoginPassword {
+                user_id_or_localpart: "@mock:example.org".to_owned(),
+                password: "password".to_owned(),
+            })
+            .await
+            .expect("login should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { success: true, .. })
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::SendMessage {
+                room_id: "!room:example.org".to_owned(),
+                client_txn_id: "txn-failure".to_owned(),
+                body: "hello".to_owned(),
+                msgtype: MessageType::Text,
+            })
+            .await
+            .expect("send message should enqueue");
+
+        let send_ack = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::SendAck(_))
+        })
+        .await;
+        match send_ack {
+            BackendEvent::SendAck(ack) => {
+                assert_eq!(ack.client_txn_id, "txn-failure");
+                assert_eq!(ack.event_id, None);
+                assert_eq!(ack.error_code.as_deref(), Some("send_network_failure"));
+            }
+            other => panic!("unexpected send ack event: {other:?}"),
+        }
+
+        assert_eq!(
+            mock_backend.calls_snapshot(),
+            vec!["login_password", "send_message"]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_restore_session_without_persisted_session_reports_auth_error() {
+        let mock_backend = Arc::new(MockRuntimeBackend::new(Vec::new()));
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: None,
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::RestoreSession)
+            .await
+            .expect("restore should enqueue");
+
+        let auth_result = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { .. })
+        })
+        .await;
+        match auth_result {
+            BackendEvent::AuthResult {
+                success,
+                error_code,
+            } => {
+                assert!(!success);
+                assert_eq!(error_code.as_deref(), Some("session_not_found"));
+            }
+            other => panic!("unexpected auth result event: {other:?}"),
+        }
+
+        assert!(mock_backend.calls_snapshot().is_empty());
     }
 
     #[tokio::test]
