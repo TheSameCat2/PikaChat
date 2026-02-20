@@ -223,11 +223,13 @@ dependencies = [
  "backend-platform",
  "matrix-sdk",
  "matrix-sdk-ui",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]

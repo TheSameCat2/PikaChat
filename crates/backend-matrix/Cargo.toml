@@ -7,11 +7,13 @@ rust-version.workspace = true
 
 [dependencies]
 backend-core = { path = "../backend-core" }
-backend-platform = { path = "../backend-platform" }
+backend-platform = { path = "../backend-platform", features = ["os-keyring"] }
 matrix-sdk.workspace = true
 matrix-sdk-ui.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 url.workspace = true
+uuid = { version = "1.21.0", features = ["v4"] }
