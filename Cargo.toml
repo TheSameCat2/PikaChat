@@ -4,6 +4,7 @@ members = [
     "crates/backend-platform",
     "crates/backend-matrix",
     "apps/backend-smoke",
+    "apps/desktop-shell",
 ]
 resolver = "3"
 

@@ -27,14 +27,7 @@ PikaChat is aiming to be the Matrix client you open before a match, not after on
 
 ## Current Project State
 
-The project currently has:
-
-- A production-grade Rust Matrix backend runtime with command/event APIs.
-- Deterministic unit/integration coverage across core backend behavior.
-- A new **Slint desktop shell** app (`apps/desktop-shell`) with:
-  - top-level menu bar,
-  - `File -> Quit`,
-  - `Help -> About Slint...` (with the built-in `AboutSlint` widget for Slint RF license compliance).
+We have begun a robust backend that implements test-critical Matrix features.
 
 ## Architecture (Current)
 
