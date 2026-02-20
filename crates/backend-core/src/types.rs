@@ -137,6 +137,10 @@ pub enum BackendEvent {
         room_id: String,
         ops: Vec<TimelineOp>,
     },
+    RoomTimelineSnapshot {
+        room_id: String,
+        items: Vec<TimelineItem>,
+    },
     SendAck(SendAck),
     CryptoStatus(CryptoStatus),
     FatalError {

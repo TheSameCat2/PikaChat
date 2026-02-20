@@ -13,7 +13,7 @@ use backend_core::{
     BackendChannelError, BackendChannels, BackendCommand, BackendError, BackendErrorCategory,
     BackendEvent, BackendInitConfig, BackendLifecycleState, BackendStateMachine, EventStream,
     MessageType, RetryPolicy, RoomSummary, SendOutcome, SyncStatus, TimelineBuffer, TimelineItem,
-    TimelineOp, classify_http_status, normalize_send_outcome,
+    TimelineMergeError, TimelineOp, classify_http_status, normalize_send_outcome,
 };
 use backend_platform::{OsKeyringSecretStore, ScopedSecretStore, SecretStoreError};
 use matrix_sdk::{
@@ -44,6 +44,7 @@ const DEFAULT_PAGINATION_LIMIT_CAP: u16 = 100;
 const ROOM_MESSAGE_EVENT_TYPE: &str = "m.room.message";
 const ROOM_REDACTION_EVENT_TYPE: &str = "m.room.redaction";
 const REL_TYPE_REPLACE: &str = "m.replace";
+const DEFAULT_TIMELINE_MAX_ITEMS: usize = 500;
 
 #[derive(Debug, Clone)]
 pub struct MatrixBackendConfig {
@@ -554,6 +555,8 @@ pub struct MatrixFrontendAdapter {
     runtime: MatrixRuntimeHandle,
     queue: std::sync::Mutex<VecDeque<QueuedFrontendCommand>>,
     next_command_id: AtomicU64,
+    timelines: Arc<std::sync::Mutex<HashMap<String, TimelineBuffer>>>,
+    timeline_max_items: usize,
     event_tx: broadcast::Sender<BackendEvent>,
     stop: CancellationToken,
     event_task: JoinHandle<()>,
@@ -561,15 +564,26 @@ pub struct MatrixFrontendAdapter {
 
 impl MatrixFrontendAdapter {
     pub fn new(runtime: MatrixRuntimeHandle) -> Self {
-        Self::with_event_buffer(runtime, 512)
+        Self::with_config(runtime, 512, DEFAULT_TIMELINE_MAX_ITEMS)
     }
 
     pub fn with_event_buffer(runtime: MatrixRuntimeHandle, event_buffer: usize) -> Self {
+        Self::with_config(runtime, event_buffer, DEFAULT_TIMELINE_MAX_ITEMS)
+    }
+
+    pub fn with_config(
+        runtime: MatrixRuntimeHandle,
+        event_buffer: usize,
+        timeline_max_items: usize,
+    ) -> Self {
         let (event_tx, _) = broadcast::channel(event_buffer.max(1));
         let stop = CancellationToken::new();
+        let timelines = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let mut runtime_events = runtime.subscribe();
         let event_tx_clone = event_tx.clone();
         let stop_clone = stop.clone();
+        let timelines_clone = timelines.clone();
+        let timeline_max_items = timeline_max_items.max(1);
         let event_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -577,6 +591,24 @@ impl MatrixFrontendAdapter {
                     recv = runtime_events.recv() => {
                         match recv {
                             Ok(event) => {
+                                if let BackendEvent::RoomTimelineDelta { room_id, ops } = &event {
+                                    let snapshot = {
+                                        let mut timelines = timelines_clone
+                                            .lock()
+                                            .expect("frontend timeline map lock poisoned");
+                                        let buffer = timelines
+                                            .entry(room_id.clone())
+                                            .or_insert_with(|| TimelineBuffer::new(timeline_max_items));
+                                        apply_timeline_ops_lenient(buffer, ops);
+                                        buffer.items().to_vec()
+                                    };
+                                    let _ = event_tx_clone.send(event.clone());
+                                    let _ = event_tx_clone.send(BackendEvent::RoomTimelineSnapshot {
+                                        room_id: room_id.clone(),
+                                        items: snapshot,
+                                    });
+                                    continue;
+                                }
                                 let _ = event_tx_clone.send(event);
                             }
                             Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -591,6 +623,8 @@ impl MatrixFrontendAdapter {
             runtime,
             queue: std::sync::Mutex::new(VecDeque::new()),
             next_command_id: AtomicU64::new(1),
+            timelines,
+            timeline_max_items,
             event_tx,
             stop,
             event_task,
@@ -628,6 +662,19 @@ impl MatrixFrontendAdapter {
             .lock()
             .expect("frontend command queue lock poisoned")
             .len()
+    }
+
+    pub fn timeline_snapshot(&self, room_id: &str) -> Vec<TimelineItem> {
+        self.timelines
+            .lock()
+            .expect("frontend timeline map lock poisoned")
+            .get(room_id)
+            .map(|buffer| buffer.items().to_vec())
+            .unwrap_or_default()
+    }
+
+    pub fn timeline_max_items(&self) -> usize {
+        self.timeline_max_items
     }
 
     pub async fn flush_one(&self) -> Result<Option<FrontendCommandId>, BackendChannelError> {
@@ -1580,6 +1627,20 @@ fn timeline_item_from_event(
     })
 }
 
+fn apply_timeline_ops_lenient(buffer: &mut TimelineBuffer, ops: &[TimelineOp]) {
+    for op in ops {
+        let result = buffer.apply_ops(std::slice::from_ref(op));
+        if let Err(TimelineMergeError::MissingEvent(_)) = result {
+            if matches!(
+                op,
+                TimelineOp::UpdateBody { .. } | TimelineOp::Remove { .. }
+            ) {
+                continue;
+            }
+        }
+    }
+}
+
 fn collect_room_summaries(client: &Client) -> Vec<RoomSummary> {
     let mut rooms: Vec<RoomSummary> = client
         .rooms()
@@ -1799,6 +1860,15 @@ mod tests {
         TimelineEvent::from_plaintext(raw)
     }
 
+    fn make_timeline_item(event_id: &str, body: &str) -> TimelineItem {
+        TimelineItem {
+            event_id: Some(event_id.to_owned()),
+            sender: "@alice:example.org".to_owned(),
+            body: body.to_owned(),
+            timestamp_ms: 1,
+        }
+    }
+
     fn mock_session() -> MatrixSession {
         MatrixSession {
             meta: SessionMeta {
@@ -1818,6 +1888,7 @@ mod tests {
         login_result: Result<(), BackendError>,
         start_sync_result: Result<(), BackendError>,
         stop_sync_result: Result<(), BackendError>,
+        open_room_result: Result<(Vec<TimelineOp>, Option<String>), BackendError>,
         send_message_result: Result<String, BackendError>,
         session: Option<MatrixSession>,
     }
@@ -1830,6 +1901,7 @@ mod tests {
                 login_result: Ok(()),
                 start_sync_result: Ok(()),
                 stop_sync_result: Ok(()),
+                open_room_result: Ok((Vec::new(), None)),
                 send_message_result: Ok("$mock-event:example.org".to_owned()),
                 session: Some(mock_session()),
             }
@@ -1861,6 +1933,14 @@ mod tests {
 
         fn with_start_sync_result(mut self, start_sync_result: Result<(), BackendError>) -> Self {
             self.start_sync_result = start_sync_result;
+            self
+        }
+
+        fn with_open_room_result(
+            mut self,
+            open_room_result: Result<(Vec<TimelineOp>, Option<String>), BackendError>,
+        ) -> Self {
+            self.open_room_result = open_room_result;
             self
         }
     }
@@ -1946,7 +2026,7 @@ mod tests {
             _limit: u16,
         ) -> Result<(Vec<TimelineOp>, Option<String>), BackendError> {
             self.record_call("open_room");
-            Ok((Vec::new(), None))
+            self.open_room_result.clone()
         }
 
         async fn paginate_back(
@@ -2775,6 +2855,88 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn frontend_adapter_tracks_timeline_snapshots_from_deltas() {
+        let room_id = "!room:example.org".to_owned();
+        let target_event_id = "$target:example.org".to_owned();
+        let initial_item = make_timeline_item(&target_event_id, "first body");
+        let mock_backend = Arc::new(
+            MockRuntimeBackend::new(Vec::new())
+                .with_open_room_result(Ok((vec![TimelineOp::Append(initial_item.clone())], None))),
+        );
+        let runtime = spawn_runtime_with_backend(mock_backend);
+        let adapter = MatrixFrontendAdapter::with_config(runtime, 64, 32);
+        let mut events = adapter.subscribe();
+
+        adapter.enqueue(BackendCommand::Init {
+            homeserver: "https://matrix.example.org".to_owned(),
+            data_dir: PathBuf::from("./.unused-test-store"),
+            config: None,
+        });
+        adapter.enqueue(BackendCommand::LoginPassword {
+            user_id_or_localpart: "@mock:example.org".to_owned(),
+            password: "password".to_owned(),
+        });
+        adapter.enqueue(BackendCommand::OpenRoom {
+            room_id: room_id.clone(),
+        });
+        adapter.enqueue(BackendCommand::EditMessage {
+            room_id: room_id.clone(),
+            target_event_id: target_event_id.clone(),
+            new_body: "edited body".to_owned(),
+            client_txn_id: "edit-txn".to_owned(),
+        });
+        adapter.enqueue(BackendCommand::RedactMessage {
+            room_id: room_id.clone(),
+            target_event_id: target_event_id.clone(),
+            reason: Some("cleanup".to_owned()),
+        });
+        adapter.flush_all().await.expect("flush should work");
+
+        let first_snapshot = recv_matching_event(&mut events, |event| match event {
+            BackendEvent::RoomTimelineSnapshot { room_id, items } => {
+                room_id == "!room:example.org" && items.len() == 1 && items[0].body == "first body"
+            }
+            _ => false,
+        })
+        .await;
+        match first_snapshot {
+            BackendEvent::RoomTimelineSnapshot { items, .. } => {
+                assert_eq!(items[0].event_id.as_deref(), Some("$target:example.org"));
+            }
+            other => panic!("unexpected first snapshot event: {other:?}"),
+        }
+
+        let edited_snapshot = recv_matching_event(&mut events, |event| match event {
+            BackendEvent::RoomTimelineSnapshot { room_id, items } => {
+                room_id == "!room:example.org" && items.len() == 1 && items[0].body == "edited body"
+            }
+            _ => false,
+        })
+        .await;
+        assert!(matches!(
+            edited_snapshot,
+            BackendEvent::RoomTimelineSnapshot { .. }
+        ));
+
+        let empty_snapshot = recv_matching_event(&mut events, |event| match event {
+            BackendEvent::RoomTimelineSnapshot { room_id, items } => {
+                room_id == "!room:example.org" && items.is_empty()
+            }
+            _ => false,
+        })
+        .await;
+        assert!(matches!(
+            empty_snapshot,
+            BackendEvent::RoomTimelineSnapshot { .. }
+        ));
+
+        assert!(adapter.timeline_snapshot(&room_id).is_empty());
+        assert_eq!(adapter.timeline_max_items(), 32);
 
         adapter.shutdown().await;
     }
