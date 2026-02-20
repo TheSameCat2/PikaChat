@@ -1,0 +1,12 @@
+[package]
+name = "backend-smoke"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+backend-core = { path = "../../crates/backend-core" }
+backend-matrix = { path = "../../crates/backend-matrix" }
+tokio.workspace = true
+tracing.workspace = true

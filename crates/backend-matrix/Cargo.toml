@@ -1,0 +1,17 @@
+[package]
+name = "backend-matrix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+backend-core = { path = "../backend-core" }
+backend-platform = { path = "../backend-platform" }
+matrix-sdk.workspace = true
+matrix-sdk-ui.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+url.workspace = true

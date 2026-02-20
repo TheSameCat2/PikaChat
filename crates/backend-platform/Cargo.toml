@@ -1,0 +1,18 @@
+[package]
+name = "backend-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dependencies.keyring]
+version = "3.6.2"
+default-features = false
+optional = true
+
+[features]
+default = []
+os-keyring = ["dep:keyring"]
