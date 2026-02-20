@@ -33,6 +33,9 @@ const SESSION_KEY_PREFIX: &str = "matrix-session";
 const DEFAULT_DEVICE_DISPLAY_NAME: &str = "PikaChat Desktop";
 const DEFAULT_OPEN_ROOM_LIMIT: u16 = 30;
 const DEFAULT_PAGINATION_LIMIT_CAP: u16 = 100;
+const ROOM_MESSAGE_EVENT_TYPE: &str = "m.room.message";
+const ROOM_REDACTION_EVENT_TYPE: &str = "m.room.redaction";
+const REL_TYPE_REPLACE: &str = "m.replace";
 
 #[derive(Debug, Clone)]
 pub struct MatrixBackendConfig {
@@ -1291,11 +1294,17 @@ fn messages_options(from_token: Option<&str>, limit: u16) -> Result<MessagesOpti
     Ok(options)
 }
 
+#[derive(Clone, Copy)]
+enum TimelineInsertMode {
+    Append,
+    Prepend,
+}
+
 fn timeline_ops_for_open(messages: Messages) -> Vec<TimelineOp> {
     let mut ops = Vec::new();
     for event in messages.chunk.iter().rev() {
-        if let Some(item) = timeline_item_from_event(event) {
-            ops.push(TimelineOp::Append(item));
+        if let Some(op) = timeline_op_from_event(event, TimelineInsertMode::Append) {
+            ops.push(op);
         }
     }
     ops
@@ -1304,8 +1313,8 @@ fn timeline_ops_for_open(messages: Messages) -> Vec<TimelineOp> {
 fn timeline_ops_for_pagination(messages: Messages) -> Vec<TimelineOp> {
     let mut ops = Vec::new();
     for event in &messages.chunk {
-        if let Some(item) = timeline_item_from_event(event) {
-            ops.push(TimelineOp::Prepend(item));
+        if let Some(op) = timeline_op_from_event(event, TimelineInsertMode::Prepend) {
+            ops.push(op);
         }
     }
     ops
@@ -1317,11 +1326,73 @@ fn timeline_ops_for_sync_events(events: &[TimelineEvent], limited: bool) -> Vec<
         ops.push(TimelineOp::Clear);
     }
     for event in events {
-        if let Some(item) = timeline_item_from_event(event) {
-            ops.push(TimelineOp::Append(item));
+        if let Some(op) = timeline_op_from_event(event, TimelineInsertMode::Append) {
+            ops.push(op);
         }
     }
     ops
+}
+
+fn timeline_op_from_event(
+    event: &TimelineEvent,
+    insert_mode: TimelineInsertMode,
+) -> Option<TimelineOp> {
+    if let Some(redaction_op) = redaction_op_from_event(event) {
+        return Some(redaction_op);
+    }
+
+    if let Some(edit_op) = edit_op_from_event(event) {
+        return Some(edit_op);
+    }
+
+    timeline_item_from_event(event).map(|item| match insert_mode {
+        TimelineInsertMode::Append => TimelineOp::Append(item),
+        TimelineInsertMode::Prepend => TimelineOp::Prepend(item),
+    })
+}
+
+fn redaction_op_from_event(event: &TimelineEvent) -> Option<TimelineOp> {
+    if event_type(event).as_deref() != Some(ROOM_REDACTION_EVENT_TYPE) {
+        return None;
+    }
+
+    let redacts = event.raw().get_field::<String>("redacts").ok().flatten()?;
+    Some(TimelineOp::Remove { event_id: redacts })
+}
+
+fn edit_op_from_event(event: &TimelineEvent) -> Option<TimelineOp> {
+    if event_type(event).as_deref() != Some(ROOM_MESSAGE_EVENT_TYPE) {
+        return None;
+    }
+
+    let content = event
+        .raw()
+        .get_field::<serde_json::Value>("content")
+        .ok()
+        .flatten()?;
+
+    let relates_to = content.get("m.relates_to")?;
+    if relates_to.get("rel_type").and_then(|value| value.as_str()) != Some(REL_TYPE_REPLACE) {
+        return None;
+    }
+
+    let target_event_id = relates_to
+        .get("event_id")
+        .and_then(|value| value.as_str())?;
+    let new_body = content
+        .get("m.new_content")
+        .and_then(|new_content| new_content.get("body"))
+        .and_then(|value| value.as_str())
+        .or_else(|| content.get("body").and_then(|value| value.as_str()))?;
+
+    Some(TimelineOp::UpdateBody {
+        event_id: target_event_id.to_owned(),
+        new_body: new_body.to_owned(),
+    })
+}
+
+fn event_type(event: &TimelineEvent) -> Option<String> {
+    event.raw().get_field::<String>("type").ok().flatten()
 }
 
 fn sync_timeline_deltas(
@@ -1535,6 +1606,59 @@ mod tests {
         TimelineEvent::from_plaintext(raw)
     }
 
+    fn make_sync_edit_event(
+        edit_event_id: &str,
+        sender: &str,
+        target_event_id: &str,
+        new_body: &str,
+        origin_server_ts: u64,
+    ) -> TimelineEvent {
+        let json = serde_json::json!({
+            "type": "m.room.message",
+            "event_id": edit_event_id,
+            "sender": sender,
+            "origin_server_ts": origin_server_ts,
+            "content": {
+                "msgtype": "m.text",
+                "body": format!("* {}", new_body),
+                "m.new_content": {
+                    "msgtype": "m.text",
+                    "body": new_body
+                },
+                "m.relates_to": {
+                    "rel_type": "m.replace",
+                    "event_id": target_event_id
+                }
+            }
+        });
+
+        let raw = Raw::<AnySyncTimelineEvent>::from_json_string(json.to_string())
+            .expect("edit event json should parse");
+        TimelineEvent::from_plaintext(raw)
+    }
+
+    fn make_sync_redaction_event(
+        redaction_event_id: &str,
+        sender: &str,
+        target_event_id: &str,
+        origin_server_ts: u64,
+    ) -> TimelineEvent {
+        let json = serde_json::json!({
+            "type": "m.room.redaction",
+            "event_id": redaction_event_id,
+            "sender": sender,
+            "origin_server_ts": origin_server_ts,
+            "redacts": target_event_id,
+            "content": {
+                "reason": "cleanup"
+            }
+        });
+
+        let raw = Raw::<AnySyncTimelineEvent>::from_json_string(json.to_string())
+            .expect("redaction event json should parse");
+        TimelineEvent::from_plaintext(raw)
+    }
+
     fn mock_session() -> MatrixSession {
         MatrixSession {
             meta: SessionMeta {
@@ -1552,6 +1676,8 @@ mod tests {
         calls: Mutex<Vec<String>>,
         rooms: Vec<RoomSummary>,
         login_result: Result<(), BackendError>,
+        start_sync_result: Result<(), BackendError>,
+        stop_sync_result: Result<(), BackendError>,
         send_message_result: Result<String, BackendError>,
         session: Option<MatrixSession>,
     }
@@ -1562,6 +1688,8 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 rooms,
                 login_result: Ok(()),
+                start_sync_result: Ok(()),
+                stop_sync_result: Ok(()),
                 send_message_result: Ok("$mock-event:example.org".to_owned()),
                 session: Some(mock_session()),
             }
@@ -1588,6 +1716,11 @@ mod tests {
             send_message_result: Result<String, BackendError>,
         ) -> Self {
             self.send_message_result = send_message_result;
+            self
+        }
+
+        fn with_start_sync_result(mut self, start_sync_result: Result<(), BackendError>) -> Self {
+            self.start_sync_result = start_sync_result;
             self
         }
     }
@@ -1629,12 +1762,12 @@ mod tests {
             _sync_request_timeout: Option<Duration>,
         ) -> Result<(), BackendError> {
             self.record_call("start_sync");
-            Ok(())
+            self.start_sync_result.clone()
         }
 
         async fn stop_sync(&self) -> Result<(), BackendError> {
             self.record_call("stop_sync");
-            Ok(())
+            self.stop_sync_result.clone()
         }
 
         async fn send_message(
@@ -1759,6 +1892,46 @@ mod tests {
         assert_eq!(ops.len(), 2);
         assert!(matches!(ops[0], TimelineOp::Clear));
         assert!(matches!(ops[1], TimelineOp::Append(_)));
+    }
+
+    #[test]
+    fn sync_timeline_ops_map_edit_events_to_update_body() {
+        let edit = make_sync_edit_event(
+            "$edit1:example.org",
+            "@alice:example.org",
+            "$target1:example.org",
+            "edited body",
+            4,
+        );
+
+        let ops = timeline_ops_for_sync_events(&[edit], false);
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            TimelineOp::UpdateBody { event_id, new_body } => {
+                assert_eq!(event_id, "$target1:example.org");
+                assert_eq!(new_body, "edited body");
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_timeline_ops_map_redaction_events_to_remove() {
+        let redaction = make_sync_redaction_event(
+            "$redact1:example.org",
+            "@alice:example.org",
+            "$target2:example.org",
+            5,
+        );
+
+        let ops = timeline_ops_for_sync_events(&[redaction], false);
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            TimelineOp::Remove { event_id } => {
+                assert_eq!(event_id, "$target2:example.org");
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
     }
 
     #[test]
@@ -2165,6 +2338,222 @@ mod tests {
         }
 
         assert!(mock_backend.calls_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_start_and_stop_sync_happy_path_transitions_state() {
+        let mock_backend = Arc::new(MockRuntimeBackend::new(Vec::new()));
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: None,
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::LoginPassword {
+                user_id_or_localpart: "@mock:example.org".to_owned(),
+                password: "password".to_owned(),
+            })
+            .await
+            .expect("login should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { success: true, .. })
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::StartSync)
+            .await
+            .expect("start sync should enqueue");
+        let started = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Syncing
+                }
+            )
+        })
+        .await;
+        assert!(matches!(
+            started,
+            BackendEvent::StateChanged {
+                state: BackendLifecycleState::Syncing
+            }
+        ));
+
+        handle
+            .send(BackendCommand::StopSync)
+            .await
+            .expect("stop sync should enqueue");
+        let stopped = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Authenticated
+                }
+            )
+        })
+        .await;
+        assert!(matches!(
+            stopped,
+            BackendEvent::StateChanged {
+                state: BackendLifecycleState::Authenticated
+            }
+        ));
+
+        assert_eq!(
+            mock_backend.calls_snapshot(),
+            vec!["login_password", "start_sync", "stop_sync"]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_start_sync_network_failure_emits_recoverable_fatal_error() {
+        let mock_backend = Arc::new(MockRuntimeBackend::new(Vec::new()).with_start_sync_result(
+            Err(BackendError::new(
+                BackendErrorCategory::Network,
+                "sync_start_network_error",
+                "temporary network issue",
+            )),
+        ));
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: None,
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::LoginPassword {
+                user_id_or_localpart: "@mock:example.org".to_owned(),
+                password: "password".to_owned(),
+            })
+            .await
+            .expect("login should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { success: true, .. })
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::StartSync)
+            .await
+            .expect("start sync should enqueue");
+        let fatal = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::FatalError { .. })
+        })
+        .await;
+
+        match fatal {
+            BackendEvent::FatalError {
+                code, recoverable, ..
+            } => {
+                assert_eq!(code, "sync_start_network_error");
+                assert!(recoverable);
+            }
+            other => panic!("unexpected fatal event: {other:?}"),
+        }
+
+        assert_eq!(
+            mock_backend.calls_snapshot(),
+            vec!["login_password", "start_sync"]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_start_sync_auth_failure_emits_nonrecoverable_fatal_error() {
+        let mock_backend = Arc::new(MockRuntimeBackend::new(Vec::new()).with_start_sync_result(
+            Err(BackendError::new(
+                BackendErrorCategory::Auth,
+                "sync_start_auth_error",
+                "unauthorized",
+            )),
+        ));
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: None,
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::LoginPassword {
+                user_id_or_localpart: "@mock:example.org".to_owned(),
+                password: "password".to_owned(),
+            })
+            .await
+            .expect("login should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { success: true, .. })
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::StartSync)
+            .await
+            .expect("start sync should enqueue");
+        let fatal = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::FatalError { .. })
+        })
+        .await;
+
+        match fatal {
+            BackendEvent::FatalError {
+                code, recoverable, ..
+            } => {
+                assert_eq!(code, "sync_start_auth_error");
+                assert!(!recoverable);
+            }
+            other => panic!("unexpected fatal event: {other:?}"),
+        }
+
+        assert_eq!(
+            mock_backend.calls_snapshot(),
+            vec!["login_password", "start_sync"]
+        );
     }
 
     #[tokio::test]

@@ -71,6 +71,9 @@ async fn run() -> Result<(), String> {
         println!("Optional: set PIKACHAT_RESTORE_SESSION=1 to try keyring session restore.");
         println!("Optional: set PIKACHAT_START_SYNC=1 to exercise StartSync/StopSync.");
         println!(
+            "Optional sync trace: PIKACHAT_SYNC_VERBOSE=1, PIKACHAT_WATCH_ROOM_ID='!room:example.org'."
+        );
+        println!(
             "Optional tuning: PIKACHAT_SYNC_REQUEST_TIMEOUT_MS, PIKACHAT_OPEN_ROOM_LIMIT, PIKACHAT_PAGINATION_LIMIT_CAP."
         );
         return Ok(());
@@ -85,14 +88,28 @@ async fn run() -> Result<(), String> {
         wait_for_state(&mut events, BackendLifecycleState::Syncing, "syncing").await?;
         println!("Sync started.");
 
+        let sync_verbose = env_truthy("PIKACHAT_SYNC_VERBOSE");
+        let watch_room_id = env::var("PIKACHAT_WATCH_ROOM_ID").ok();
         let observe_secs = env::var("PIKACHAT_SYNC_OBSERVE_SECS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(DEFAULT_SYNC_OBSERVE_SECS);
-        let stats = observe_sync_events(&mut events, Duration::from_secs(observe_secs)).await?;
+        let stats = observe_sync_events(
+            &mut events,
+            Duration::from_secs(observe_secs),
+            sync_verbose,
+            watch_room_id.as_deref(),
+        )
+        .await?;
         println!(
-            "Observed sync for {}s: room_list_updates={}, timeline_deltas={}",
-            observe_secs, stats.room_list_updates, stats.timeline_deltas
+            "Observed sync for {}s: room_list_updates={}, timeline_deltas={}, append_ops={}, update_ops={}, remove_ops={}, clear_ops={}",
+            observe_secs,
+            stats.room_list_updates,
+            stats.timeline_deltas,
+            stats.append_ops,
+            stats.update_ops,
+            stats.remove_ops,
+            stats.clear_ops
         );
 
         send_command(&runtime, BackendCommand::StopSync, "StopSync").await?;
@@ -211,11 +228,17 @@ async fn wait_for_send_ack(
 struct SyncObserveStats {
     room_list_updates: usize,
     timeline_deltas: usize,
+    append_ops: usize,
+    update_ops: usize,
+    remove_ops: usize,
+    clear_ops: usize,
 }
 
 async fn observe_sync_events(
     events: &mut EventStream,
     duration: Duration,
+    verbose: bool,
+    watch_room_id: Option<&str>,
 ) -> Result<SyncObserveStats, String> {
     let deadline = tokio::time::Instant::now() + duration;
     let mut stats = SyncObserveStats::default();
@@ -236,8 +259,57 @@ async fn observe_sync_events(
             BackendEvent::RoomListUpdated { .. } => {
                 stats.room_list_updates += 1;
             }
-            BackendEvent::RoomTimelineDelta { .. } => {
+            BackendEvent::RoomTimelineDelta { room_id, ops } => {
+                if watch_room_id.is_some_and(|watch| watch != room_id) {
+                    continue;
+                }
+
                 stats.timeline_deltas += 1;
+                for op in ops {
+                    match op {
+                        backend_core::TimelineOp::Append(item) => {
+                            stats.append_ops += 1;
+                            if verbose {
+                                println!(
+                                    "sync delta room={} op=append event_id={:?} sender={} body={}",
+                                    room_id, item.event_id, item.sender, item.body
+                                );
+                            }
+                        }
+                        backend_core::TimelineOp::Prepend(item) => {
+                            if verbose {
+                                println!(
+                                    "sync delta room={} op=prepend event_id={:?} sender={} body={}",
+                                    room_id, item.event_id, item.sender, item.body
+                                );
+                            }
+                        }
+                        backend_core::TimelineOp::UpdateBody { event_id, new_body } => {
+                            stats.update_ops += 1;
+                            if verbose {
+                                println!(
+                                    "sync delta room={} op=update event_id={} body={}",
+                                    room_id, event_id, new_body
+                                );
+                            }
+                        }
+                        backend_core::TimelineOp::Remove { event_id } => {
+                            stats.remove_ops += 1;
+                            if verbose {
+                                println!(
+                                    "sync delta room={} op=remove event_id={}",
+                                    room_id, event_id
+                                );
+                            }
+                        }
+                        backend_core::TimelineOp::Clear => {
+                            stats.clear_ops += 1;
+                            if verbose {
+                                println!("sync delta room={} op=clear", room_id);
+                            }
+                        }
+                    }
+                }
             }
             BackendEvent::FatalError { code, message, .. } => {
                 return Err(format!("fatal backend error ({code}): {message}"));
