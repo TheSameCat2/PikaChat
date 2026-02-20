@@ -1,10 +1,12 @@
 use std::{
-    env,
+    env::{self, VarError},
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use backend_core::{BackendCommand, BackendEvent, BackendLifecycleState, EventStream};
+use backend_core::{
+    BackendCommand, BackendEvent, BackendInitConfig, BackendLifecycleState, EventStream,
+};
 use backend_matrix::spawn_runtime;
 use tokio::{sync::broadcast, time::timeout};
 
@@ -26,6 +28,7 @@ async fn run() -> Result<(), String> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("./.pikachat-smoke-store"));
     let restore_session = env_truthy("PIKACHAT_RESTORE_SESSION");
+    let init_config = init_config_from_env()?;
 
     let runtime = spawn_runtime();
     let mut events = runtime.subscribe();
@@ -35,7 +38,7 @@ async fn run() -> Result<(), String> {
         BackendCommand::Init {
             homeserver: homeserver.clone(),
             data_dir,
-            config: None,
+            config: init_config,
         },
         "Init",
     )
@@ -67,6 +70,9 @@ async fn run() -> Result<(), String> {
         println!("Optional: set PIKACHAT_DM_TARGET to send a DM smoke message.");
         println!("Optional: set PIKACHAT_RESTORE_SESSION=1 to try keyring session restore.");
         println!("Optional: set PIKACHAT_START_SYNC=1 to exercise StartSync/StopSync.");
+        println!(
+            "Optional tuning: PIKACHAT_SYNC_REQUEST_TIMEOUT_MS, PIKACHAT_OPEN_ROOM_LIMIT, PIKACHAT_PAGINATION_LIMIT_CAP."
+        );
         return Ok(());
     }
 
@@ -281,6 +287,47 @@ fn env_truthy(key: &str) -> bool {
     env::var(key)
         .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
         .unwrap_or(false)
+}
+
+fn init_config_from_env() -> Result<Option<BackendInitConfig>, String> {
+    let sync_request_timeout_ms = parse_optional_u64_env("PIKACHAT_SYNC_REQUEST_TIMEOUT_MS")?;
+    let default_open_room_limit = parse_optional_u16_env("PIKACHAT_OPEN_ROOM_LIMIT")?;
+    let pagination_limit_cap = parse_optional_u16_env("PIKACHAT_PAGINATION_LIMIT_CAP")?;
+
+    if sync_request_timeout_ms.is_none()
+        && default_open_room_limit.is_none()
+        && pagination_limit_cap.is_none()
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(BackendInitConfig {
+        sync_request_timeout_ms,
+        default_open_room_limit,
+        pagination_limit_cap,
+    }))
+}
+
+fn parse_optional_u64_env(key: &str) -> Result<Option<u64>, String> {
+    match env::var(key) {
+        Ok(value) => value
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|err| format!("invalid {key}='{value}': {err}")),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(_)) => Err(format!("{key} contains non-unicode data")),
+    }
+}
+
+fn parse_optional_u16_env(key: &str) -> Result<Option<u16>, String> {
+    match env::var(key) {
+        Ok(value) => value
+            .parse::<u16>()
+            .map(Some)
+            .map_err(|err| format!("invalid {key}='{value}': {err}")),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(VarError::NotUnicode(_)) => Err(format!("{key} contains non-unicode data")),
+    }
 }
 
 fn monotonic_nonce() -> u128 {
