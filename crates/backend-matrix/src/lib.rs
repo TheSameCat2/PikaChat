@@ -1,4 +1,12 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use backend_core::{
@@ -524,6 +532,138 @@ pub fn spawn_runtime() -> MatrixRuntimeHandle {
     });
 
     MatrixRuntimeHandle { channels }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FrontendCommandId(u64);
+
+impl FrontendCommandId {
+    pub fn value(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone)]
+struct QueuedFrontendCommand {
+    id: FrontendCommandId,
+    command: BackendCommand,
+}
+
+#[derive(Debug)]
+pub struct MatrixFrontendAdapter {
+    runtime: MatrixRuntimeHandle,
+    queue: std::sync::Mutex<VecDeque<QueuedFrontendCommand>>,
+    next_command_id: AtomicU64,
+    event_tx: broadcast::Sender<BackendEvent>,
+    stop: CancellationToken,
+    event_task: JoinHandle<()>,
+}
+
+impl MatrixFrontendAdapter {
+    pub fn new(runtime: MatrixRuntimeHandle) -> Self {
+        Self::with_event_buffer(runtime, 512)
+    }
+
+    pub fn with_event_buffer(runtime: MatrixRuntimeHandle, event_buffer: usize) -> Self {
+        let (event_tx, _) = broadcast::channel(event_buffer.max(1));
+        let stop = CancellationToken::new();
+        let mut runtime_events = runtime.subscribe();
+        let event_tx_clone = event_tx.clone();
+        let stop_clone = stop.clone();
+        let event_task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = stop_clone.cancelled() => break,
+                    recv = runtime_events.recv() => {
+                        match recv {
+                            Ok(event) => {
+                                let _ = event_tx_clone.send(event);
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                }
+            }
+        });
+
+        Self {
+            runtime,
+            queue: std::sync::Mutex::new(VecDeque::new()),
+            next_command_id: AtomicU64::new(1),
+            event_tx,
+            stop,
+            event_task,
+        }
+    }
+
+    pub fn subscribe(&self) -> EventStream {
+        self.event_tx.subscribe()
+    }
+
+    pub fn enqueue(&self, command: BackendCommand) -> FrontendCommandId {
+        let id = FrontendCommandId(self.next_command_id.fetch_add(1, Ordering::Relaxed));
+        self.queue
+            .lock()
+            .expect("frontend command queue lock poisoned")
+            .push_back(QueuedFrontendCommand { id, command });
+        id
+    }
+
+    pub fn cancel(&self, command_id: FrontendCommandId) -> bool {
+        let mut queue = self
+            .queue
+            .lock()
+            .expect("frontend command queue lock poisoned");
+        if let Some(index) = queue.iter().position(|item| item.id == command_id) {
+            queue.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn queued_len(&self) -> usize {
+        self.queue
+            .lock()
+            .expect("frontend command queue lock poisoned")
+            .len()
+    }
+
+    pub async fn flush_one(&self) -> Result<Option<FrontendCommandId>, BackendChannelError> {
+        let maybe_command = self
+            .queue
+            .lock()
+            .expect("frontend command queue lock poisoned")
+            .pop_front();
+
+        let Some(queued) = maybe_command else {
+            return Ok(None);
+        };
+
+        if let Err(err) = self.runtime.send(queued.command.clone()).await {
+            self.queue
+                .lock()
+                .expect("frontend command queue lock poisoned")
+                .push_front(queued);
+            return Err(err);
+        }
+
+        Ok(Some(queued.id))
+    }
+
+    pub async fn flush_all(&self) -> Result<usize, BackendChannelError> {
+        let mut count = 0;
+        while self.flush_one().await?.is_some() {
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    pub async fn shutdown(self) {
+        self.stop.cancel();
+        let _ = self.event_task.await;
+    }
 }
 
 #[cfg(test)]
@@ -2554,6 +2694,89 @@ mod tests {
             mock_backend.calls_snapshot(),
             vec!["login_password", "start_sync"]
         );
+    }
+
+    #[tokio::test]
+    async fn frontend_adapter_supports_queue_cancellation_and_flush() {
+        let mock_backend = Arc::new(MockRuntimeBackend::new(vec![RoomSummary {
+            room_id: "!room:example.org".to_owned(),
+            name: Some("Mock Room".to_owned()),
+            unread_notifications: 0,
+            highlight_count: 0,
+            is_direct: false,
+        }]));
+        let runtime = spawn_runtime_with_backend(mock_backend.clone());
+        let adapter = MatrixFrontendAdapter::new(runtime);
+        let mut events = adapter.subscribe();
+
+        let _init_id = adapter.enqueue(BackendCommand::Init {
+            homeserver: "https://matrix.example.org".to_owned(),
+            data_dir: PathBuf::from("./.unused-test-store"),
+            config: None,
+        });
+        let _login_id = adapter.enqueue(BackendCommand::LoginPassword {
+            user_id_or_localpart: "@mock:example.org".to_owned(),
+            password: "password".to_owned(),
+        });
+        let list_id = adapter.enqueue(BackendCommand::ListRooms);
+        let send_id = adapter.enqueue(BackendCommand::SendMessage {
+            room_id: "!room:example.org".to_owned(),
+            client_txn_id: "txn-adapter".to_owned(),
+            body: "hello".to_owned(),
+            msgtype: MessageType::Text,
+        });
+
+        assert_eq!(adapter.queued_len(), 4);
+        assert!(adapter.cancel(list_id));
+        assert_eq!(adapter.queued_len(), 3);
+        assert!(!adapter.cancel(FrontendCommandId(999_999)));
+
+        let flushed = adapter.flush_all().await.expect("flush should work");
+        assert_eq!(flushed, 3);
+        assert_eq!(adapter.queued_len(), 0);
+
+        let send_ack = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::SendAck(_))
+        })
+        .await;
+        match send_ack {
+            BackendEvent::SendAck(ack) => {
+                assert_eq!(ack.client_txn_id, "txn-adapter");
+                assert_eq!(ack.error_code, None);
+            }
+            other => panic!("unexpected send ack event: {other:?}"),
+        }
+
+        assert!(!adapter.cancel(send_id));
+        assert_eq!(
+            mock_backend.calls_snapshot(),
+            vec!["login_password", "send_message"]
+        );
+
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn frontend_adapter_forwards_runtime_events() {
+        let runtime = spawn_runtime();
+        let adapter = MatrixFrontendAdapter::new(runtime);
+        let mut events = adapter.subscribe();
+
+        adapter.enqueue(BackendCommand::StartSync);
+        adapter.flush_all().await.expect("flush should work");
+
+        let event = recv_matching_event(&mut events, |candidate| {
+            matches!(candidate, BackendEvent::FatalError { .. })
+        })
+        .await;
+        match event {
+            BackendEvent::FatalError { code, .. } => {
+                assert_eq!(code, "invalid_state_transition");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        adapter.shutdown().await;
     }
 
     #[tokio::test]
