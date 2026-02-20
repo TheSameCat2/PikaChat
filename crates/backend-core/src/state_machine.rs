@@ -60,7 +60,9 @@ impl BackendStateMachine {
             | SendDmText { .. }
             | SendMessage { .. }
             | EditMessage { .. }
-            | RedactMessage { .. } => {
+            | RedactMessage { .. }
+            | UploadMedia { .. }
+            | DownloadMedia { .. } => {
                 if self.is_authenticated_context() {
                     Ok(Vec::new())
                 } else {
@@ -219,6 +221,23 @@ mod tests {
                 body: "hello".into(),
             })
             .expect_err("dm command should fail when not authenticated");
+        assert_eq!(err.code, "invalid_state_transition");
+
+        let err = sm
+            .apply(&BackendCommand::UploadMedia {
+                client_txn_id: "tx-3".into(),
+                content_type: "text/plain".into(),
+                data: vec![1, 2, 3],
+            })
+            .expect_err("media upload command should fail when not authenticated");
+        assert_eq!(err.code, "invalid_state_transition");
+
+        let err = sm
+            .apply(&BackendCommand::DownloadMedia {
+                client_txn_id: "tx-4".into(),
+                source: "mxc://example.org/media".into(),
+            })
+            .expect_err("media download command should fail when not authenticated");
         assert_eq!(err.code, "invalid_state_transition");
     }
 }

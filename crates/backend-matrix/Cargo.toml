@@ -11,6 +11,7 @@ backend-core = { path = "../backend-core" }
 backend-platform = { path = "../backend-platform", features = ["os-keyring"] }
 matrix-sdk.workspace = true
 matrix-sdk-ui.workspace = true
+mime = "0.3.17"
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

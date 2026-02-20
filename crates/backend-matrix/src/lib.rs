@@ -13,8 +13,9 @@ use async_trait::async_trait;
 use backend_core::{
     BackendChannelError, BackendChannels, BackendCommand, BackendError, BackendErrorCategory,
     BackendEvent, BackendInitConfig, BackendLifecycleState, BackendStateMachine, EventStream,
-    MessageType, RetryPolicy, RoomSummary, SendOutcome, SyncStatus, TimelineBuffer, TimelineItem,
-    TimelineMergeError, TimelineOp, classify_http_status, normalize_send_outcome,
+    MediaDownloadAck, MediaUploadAck, MessageType, RetryPolicy, RoomSummary, SendOutcome,
+    SyncStatus, TimelineBuffer, TimelineItem, TimelineMergeError, TimelineOp, classify_http_status,
+    normalize_send_outcome,
 };
 use backend_platform::{OsKeyringSecretStore, ScopedSecretStore, SecretStoreError};
 use matrix_sdk::{
@@ -22,11 +23,15 @@ use matrix_sdk::{
     authentication::matrix::MatrixSession,
     config::SyncSettings,
     deserialized_responses::TimelineEvent,
+    media::{MediaFormat, MediaRequestParameters},
     room::{Messages, MessagesOptions, edit::EditedContent},
     ruma::{
-        OwnedEventId, OwnedRoomId, OwnedUserId, UInt,
+        OwnedEventId, OwnedMxcUri, OwnedRoomId, OwnedUserId, UInt,
         api::client::error::{ErrorKind, RetryAfter},
-        events::room::message::{RoomMessageEventContent, RoomMessageEventContentWithoutRelation},
+        events::room::{
+            MediaSource,
+            message::{RoomMessageEventContent, RoomMessageEventContentWithoutRelation},
+        },
     },
 };
 use tokio::{
@@ -361,6 +366,34 @@ impl MatrixBackend {
         Ok(response.event_id.to_string())
     }
 
+    pub async fn upload_media(
+        &self,
+        content_type: &str,
+        data: Vec<u8>,
+    ) -> Result<String, BackendError> {
+        let content_type = parse_media_content_type(content_type)?;
+        let response = self
+            .client
+            .media()
+            .upload(&content_type, data, None)
+            .await
+            .map_err(map_matrix_error)?;
+        Ok(response.content_uri.to_string())
+    }
+
+    pub async fn download_media(&self, source: &str) -> Result<Vec<u8>, BackendError> {
+        let source = parse_mxc_uri(source)?;
+        let request = MediaRequestParameters {
+            source: MediaSource::Plain(source),
+            format: MediaFormat::File,
+        };
+        self.client
+            .media()
+            .get_media_content(&request, true)
+            .await
+            .map_err(map_matrix_error)
+    }
+
     fn lookup_room(&self, room_id: &str) -> Result<matrix_sdk::Room, BackendError> {
         let room_id = parse_room_id(room_id)?;
         self.client.get_room(&room_id).ok_or_else(|| {
@@ -421,6 +454,9 @@ trait RuntimeBackend: Send + Sync {
         limit: u16,
     ) -> Result<(Vec<TimelineOp>, Option<String>), BackendError>;
     async fn send_dm_text(&self, user_id: &str, body: &str) -> Result<String, BackendError>;
+    async fn upload_media(&self, content_type: &str, data: Vec<u8>)
+    -> Result<String, BackendError>;
+    async fn download_media(&self, source: &str) -> Result<Vec<u8>, BackendError>;
 }
 
 #[async_trait]
@@ -509,6 +545,18 @@ impl RuntimeBackend for MatrixBackend {
 
     async fn send_dm_text(&self, user_id: &str, body: &str) -> Result<String, BackendError> {
         MatrixBackend::send_dm_text(self, user_id, body).await
+    }
+
+    async fn upload_media(
+        &self,
+        content_type: &str,
+        data: Vec<u8>,
+    ) -> Result<String, BackendError> {
+        MatrixBackend::upload_media(self, content_type, data).await
+    }
+
+    async fn download_media(&self, source: &str) -> Result<Vec<u8>, BackendError> {
+        MatrixBackend::download_media(self, source).await
     }
 }
 
@@ -862,6 +910,22 @@ impl MatrixRuntime {
             } => {
                 self.handle_redact_message(room_id, target_event_id, reason)
                     .await
+            }
+            BackendCommand::UploadMedia {
+                client_txn_id,
+                content_type,
+                data,
+            } => {
+                self.handle_upload_media(client_txn_id, content_type, data)
+                    .await;
+                Ok(())
+            }
+            BackendCommand::DownloadMedia {
+                client_txn_id,
+                source,
+            } => {
+                self.handle_download_media(client_txn_id, source).await;
+                Ok(())
             }
             BackendCommand::Logout => self.handle_logout().await,
         }
@@ -1233,6 +1297,116 @@ impl MatrixRuntime {
         Ok(())
     }
 
+    async fn handle_upload_media(
+        &mut self,
+        client_txn_id: String,
+        content_type: String,
+        data: Vec<u8>,
+    ) {
+        let validation = self.validate_transition(BackendCommand::UploadMedia {
+            client_txn_id: String::new(),
+            content_type: String::new(),
+            data: Vec::new(),
+        });
+
+        if let Err(err) = validation {
+            self.channels
+                .emit(BackendEvent::MediaUploadAck(MediaUploadAck {
+                    client_txn_id,
+                    content_uri: None,
+                    error_code: Some(err.code),
+                }));
+            return;
+        }
+
+        let backend = match self.require_backend() {
+            Ok(backend) => backend,
+            Err(err) => {
+                self.channels
+                    .emit(BackendEvent::MediaUploadAck(MediaUploadAck {
+                        client_txn_id,
+                        content_uri: None,
+                        error_code: Some(err.code),
+                    }));
+                return;
+            }
+        };
+
+        let outcome = backend.upload_media(&content_type, data).await;
+        match outcome {
+            Ok(content_uri) => self
+                .channels
+                .emit(BackendEvent::MediaUploadAck(MediaUploadAck {
+                    client_txn_id,
+                    content_uri: Some(content_uri),
+                    error_code: None,
+                })),
+            Err(err) => self
+                .channels
+                .emit(BackendEvent::MediaUploadAck(MediaUploadAck {
+                    client_txn_id,
+                    content_uri: None,
+                    error_code: Some(err.code),
+                })),
+        }
+    }
+
+    async fn handle_download_media(&mut self, client_txn_id: String, source: String) {
+        let validation = self.validate_transition(BackendCommand::DownloadMedia {
+            client_txn_id: String::new(),
+            source: String::new(),
+        });
+
+        if let Err(err) = validation {
+            self.channels
+                .emit(BackendEvent::MediaDownloadAck(MediaDownloadAck {
+                    client_txn_id,
+                    source,
+                    data: None,
+                    content_type: None,
+                    error_code: Some(err.code),
+                }));
+            return;
+        }
+
+        let backend = match self.require_backend() {
+            Ok(backend) => backend,
+            Err(err) => {
+                self.channels
+                    .emit(BackendEvent::MediaDownloadAck(MediaDownloadAck {
+                        client_txn_id,
+                        source,
+                        data: None,
+                        content_type: None,
+                        error_code: Some(err.code),
+                    }));
+                return;
+            }
+        };
+
+        let outcome = backend.download_media(&source).await;
+        match outcome {
+            Ok(data) => self
+                .channels
+                .emit(BackendEvent::MediaDownloadAck(MediaDownloadAck {
+                    client_txn_id,
+                    source,
+                    data: Some(data),
+                    content_type: None,
+                    error_code: None,
+                })),
+            Err(err) => self
+                .channels
+                .emit(BackendEvent::MediaDownloadAck(MediaDownloadAck {
+                    client_txn_id,
+                    source,
+                    data: None,
+                    content_type: None,
+                    error_code: Some(err.code),
+                })),
+        }
+    }
+
     async fn handle_logout(&mut self) -> Result<(), BackendError> {
         let (candidate, transition_events) = self.validate_transition(BackendCommand::Logout)?;
         let backend = self.require_backend()?;
@@ -1426,6 +1600,28 @@ fn parse_user_id(value: &str) -> Result<OwnedUserId, BackendError> {
             BackendErrorCategory::Config,
             "invalid_user_id",
             format!("invalid user id '{value}': {err}"),
+        )
+    })
+}
+
+fn parse_mxc_uri(value: &str) -> Result<OwnedMxcUri, BackendError> {
+    let uri = OwnedMxcUri::from(value.to_owned());
+    uri.validate().map_err(|err| {
+        BackendError::new(
+            BackendErrorCategory::Config,
+            "invalid_mxc_uri",
+            format!("invalid mxc uri '{value}': {err}"),
+        )
+    })?;
+    Ok(uri)
+}
+
+fn parse_media_content_type(value: &str) -> Result<mime::Mime, BackendError> {
+    value.parse::<mime::Mime>().map_err(|err| {
+        BackendError::new(
+            BackendErrorCategory::Config,
+            "invalid_media_content_type",
+            format!("invalid media content type '{value}': {err}"),
         )
     })
 }
@@ -1965,6 +2161,8 @@ mod tests {
         stop_sync_result: Result<(), BackendError>,
         open_room_result: Result<(Vec<TimelineOp>, Option<String>), BackendError>,
         send_message_result: Result<String, BackendError>,
+        upload_media_result: Result<String, BackendError>,
+        download_media_result: Result<Vec<u8>, BackendError>,
         session: Option<MatrixSession>,
     }
 
@@ -1981,6 +2179,8 @@ mod tests {
                 stop_sync_result: Ok(()),
                 open_room_result: Ok((Vec::new(), None)),
                 send_message_result: Ok("$mock-event:example.org".to_owned()),
+                upload_media_result: Ok("mxc://example.org/mock-media".to_owned()),
+                download_media_result: Ok(b"mock-media".to_vec()),
                 session: Some(mock_session()),
             }
         }
@@ -2040,6 +2240,22 @@ mod tests {
             open_room_result: Result<(Vec<TimelineOp>, Option<String>), BackendError>,
         ) -> Self {
             self.open_room_result = open_room_result;
+            self
+        }
+
+        fn with_upload_media_result(
+            mut self,
+            upload_media_result: Result<String, BackendError>,
+        ) -> Self {
+            self.upload_media_result = upload_media_result;
+            self
+        }
+
+        fn with_download_media_result(
+            mut self,
+            download_media_result: Result<Vec<u8>, BackendError>,
+        ) -> Self {
+            self.download_media_result = download_media_result;
             self
         }
     }
@@ -2154,6 +2370,20 @@ mod tests {
             self.record_call("send_dm_text");
             Ok("$mock-dm:example.org".to_owned())
         }
+
+        async fn upload_media(
+            &self,
+            _content_type: &str,
+            _data: Vec<u8>,
+        ) -> Result<String, BackendError> {
+            self.record_call("upload_media");
+            self.upload_media_result.clone()
+        }
+
+        async fn download_media(&self, _source: &str) -> Result<Vec<u8>, BackendError> {
+            self.record_call("download_media");
+            self.download_media_result.clone()
+        }
     }
 
     async fn recv_matching_event<F>(events: &mut EventStream, mut predicate: F) -> BackendEvent
@@ -2187,6 +2417,20 @@ mod tests {
     fn rejects_invalid_user_id() {
         let err = parse_user_id("not-a-user").expect_err("invalid user id must fail");
         assert_eq!(err.code, "invalid_user_id");
+    }
+
+    #[test]
+    fn rejects_invalid_mxc_uri() {
+        let err =
+            parse_mxc_uri("https://example.org/not-mxc").expect_err("invalid mxc uri must fail");
+        assert_eq!(err.code, "invalid_mxc_uri");
+    }
+
+    #[test]
+    fn rejects_invalid_media_content_type() {
+        let err = parse_media_content_type("bad-content-type")
+            .expect_err("invalid media content type must fail");
+        assert_eq!(err.code, "invalid_media_content_type");
     }
 
     #[test]
@@ -2688,6 +2932,295 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_upload_media_outside_authenticated_context_emits_upload_ack_failure() {
+        let handle = spawn_runtime();
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::UploadMedia {
+                client_txn_id: "tx-upload-1".to_owned(),
+                content_type: "text/plain".to_owned(),
+                data: b"hello".to_vec(),
+            })
+            .await
+            .expect("command should enqueue");
+
+        let event = timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("event timeout")
+            .expect("event receive");
+
+        match event {
+            BackendEvent::MediaUploadAck(ack) => {
+                assert_eq!(ack.client_txn_id, "tx-upload-1");
+                assert_eq!(ack.content_uri, None);
+                assert_eq!(ack.error_code.as_deref(), Some("invalid_state_transition"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_download_media_outside_authenticated_context_emits_download_ack_failure() {
+        let handle = spawn_runtime();
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::DownloadMedia {
+                client_txn_id: "tx-download-1".to_owned(),
+                source: "mxc://example.org/file".to_owned(),
+            })
+            .await
+            .expect("command should enqueue");
+
+        let event = timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("event timeout")
+            .expect("event receive");
+
+        match event {
+            BackendEvent::MediaDownloadAck(ack) => {
+                assert_eq!(ack.client_txn_id, "tx-download-1");
+                assert_eq!(ack.source, "mxc://example.org/file");
+                assert_eq!(ack.data, None);
+                assert_eq!(ack.error_code.as_deref(), Some("invalid_state_transition"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_upload_and_download_media_happy_path_is_deterministic() {
+        let mock_backend = Arc::new(
+            MockRuntimeBackend::new(Vec::new())
+                .with_upload_media_result(Ok("mxc://example.org/uploaded".to_owned()))
+                .with_download_media_result(Ok(b"binary-payload".to_vec())),
+        );
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: None,
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::LoginPassword {
+                user_id_or_localpart: "@mock:example.org".to_owned(),
+                password: "password".to_owned(),
+            })
+            .await
+            .expect("login should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { success: true, .. })
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::UploadMedia {
+                client_txn_id: "tx-upload-ok".to_owned(),
+                content_type: "application/octet-stream".to_owned(),
+                data: b"binary-payload".to_vec(),
+            })
+            .await
+            .expect("upload should enqueue");
+        let upload_ack = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::MediaUploadAck(MediaUploadAck {
+                    client_txn_id,
+                    content_uri: Some(_),
+                    error_code: None,
+                }) if client_txn_id == "tx-upload-ok"
+            )
+        })
+        .await;
+        match upload_ack {
+            BackendEvent::MediaUploadAck(ack) => {
+                assert_eq!(
+                    ack.content_uri.as_deref(),
+                    Some("mxc://example.org/uploaded")
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        handle
+            .send(BackendCommand::DownloadMedia {
+                client_txn_id: "tx-download-ok".to_owned(),
+                source: "mxc://example.org/uploaded".to_owned(),
+            })
+            .await
+            .expect("download should enqueue");
+        let download_ack = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::MediaDownloadAck(MediaDownloadAck {
+                    client_txn_id,
+                    source,
+                    data: Some(_),
+                    error_code: None,
+                    ..
+                }) if client_txn_id == "tx-download-ok" && source == "mxc://example.org/uploaded"
+            )
+        })
+        .await;
+        match download_ack {
+            BackendEvent::MediaDownloadAck(ack) => {
+                assert_eq!(ack.data.as_deref(), Some(&b"binary-payload"[..]));
+                assert_eq!(ack.content_type, None);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        assert_eq!(
+            mock_backend.calls_snapshot(),
+            vec!["login_password", "upload_media", "download_media"]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_upload_media_failure_emits_upload_ack_error_code() {
+        let mock_backend = Arc::new(
+            MockRuntimeBackend::new(Vec::new()).with_upload_media_result(Err(BackendError::new(
+                BackendErrorCategory::Network,
+                "media_upload_failed",
+                "upload failed",
+            ))),
+        );
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: None,
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::LoginPassword {
+                user_id_or_localpart: "@mock:example.org".to_owned(),
+                password: "password".to_owned(),
+            })
+            .await
+            .expect("login should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { success: true, .. })
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::UploadMedia {
+                client_txn_id: "tx-upload-fail".to_owned(),
+                content_type: "application/octet-stream".to_owned(),
+                data: b"payload".to_vec(),
+            })
+            .await
+            .expect("upload should enqueue");
+        let upload_ack = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::MediaUploadAck(MediaUploadAck {
+                    client_txn_id,
+                    content_uri: None,
+                    error_code: Some(code),
+                }) if client_txn_id == "tx-upload-fail" && code == "media_upload_failed"
+            )
+        })
+        .await;
+        assert!(matches!(upload_ack, BackendEvent::MediaUploadAck(_)));
+    }
+
+    #[tokio::test]
+    async fn runtime_download_media_failure_emits_download_ack_error_code() {
+        let mock_backend = Arc::new(
+            MockRuntimeBackend::new(Vec::new()).with_download_media_result(Err(BackendError::new(
+                BackendErrorCategory::Network,
+                "media_download_failed",
+                "boom",
+            ))),
+        );
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: None,
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::LoginPassword {
+                user_id_or_localpart: "@mock:example.org".to_owned(),
+                password: "password".to_owned(),
+            })
+            .await
+            .expect("login should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { success: true, .. })
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::DownloadMedia {
+                client_txn_id: "tx-download-fail".to_owned(),
+                source: "mxc://example.org/uploaded".to_owned(),
+            })
+            .await
+            .expect("download should enqueue");
+        let download_ack = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::MediaDownloadAck(MediaDownloadAck {
+                    client_txn_id,
+                    data: None,
+                    error_code: Some(code),
+                    ..
+                }) if client_txn_id == "tx-download-fail" && code == "media_download_failed"
+            )
+        })
+        .await;
+        assert!(matches!(download_ack, BackendEvent::MediaDownloadAck(_)));
     }
 
     #[tokio::test]

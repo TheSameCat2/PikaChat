@@ -1,5 +1,6 @@
 use std::{
     env::{self, VarError},
+    fs,
     path::PathBuf,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -78,6 +79,9 @@ async fn run() -> Result<(), String> {
             println!(
                 "Optional tuning: PIKACHAT_SYNC_REQUEST_TIMEOUT_MS, PIKACHAT_OPEN_ROOM_LIMIT, PIKACHAT_PAGINATION_LIMIT_CAP."
             );
+            println!(
+                "Optional media smoke: PIKACHAT_MEDIA_UPLOAD_FILE, PIKACHAT_MEDIA_CONTENT_TYPE, PIKACHAT_MEDIA_DOWNLOAD_MXC."
+            );
             return Ok(());
         }
 
@@ -142,6 +146,69 @@ async fn run() -> Result<(), String> {
 
             let event_id = wait_for_send_ack(&mut events, &client_txn_id).await?;
             println!("Sent DM to {dm_target} as event {event_id}");
+        }
+
+        let mut uploaded_media: Option<(String, Vec<u8>)> = None;
+        if let Some(upload_path) = env::var("PIKACHAT_MEDIA_UPLOAD_FILE").ok() {
+            let upload_bytes =
+                fs::read(&upload_path).map_err(|err| format!("failed to read media file '{upload_path}': {err}"))?;
+            let content_type = env::var("PIKACHAT_MEDIA_CONTENT_TYPE")
+                .unwrap_or_else(|_| "application/octet-stream".to_owned());
+            let client_txn_id = format!("smoke-upload-{}", monotonic_nonce());
+
+            send_command(
+                &adapter,
+                BackendCommand::UploadMedia {
+                    client_txn_id: client_txn_id.clone(),
+                    content_type,
+                    data: upload_bytes.clone(),
+                },
+                "UploadMedia",
+            )
+            .await?;
+
+            let content_uri = wait_for_media_upload_ack(&mut events, &client_txn_id).await?;
+            println!(
+                "Uploaded media from {} ({} bytes) -> {}",
+                upload_path,
+                upload_bytes.len(),
+                content_uri
+            );
+            uploaded_media = Some((content_uri, upload_bytes));
+        }
+
+        let explicit_download_uri = env::var("PIKACHAT_MEDIA_DOWNLOAD_MXC").ok();
+        let download_uri = explicit_download_uri
+            .or_else(|| uploaded_media.as_ref().map(|(uri, _)| uri.clone()));
+
+        if let Some(download_uri) = download_uri {
+            let client_txn_id = format!("smoke-download-{}", monotonic_nonce());
+            send_command(
+                &adapter,
+                BackendCommand::DownloadMedia {
+                    client_txn_id: client_txn_id.clone(),
+                    source: download_uri.clone(),
+                },
+                "DownloadMedia",
+            )
+            .await?;
+
+            let downloaded = wait_for_media_download_ack(&mut events, &client_txn_id).await?;
+            println!(
+                "Downloaded media {} ({} bytes)",
+                download_uri,
+                downloaded.len()
+            );
+
+            if let Some((uploaded_uri, uploaded_bytes)) = uploaded_media
+                && uploaded_uri == download_uri
+            {
+                if uploaded_bytes == downloaded {
+                    println!("Media roundtrip verified: upload and download bytes match.");
+                } else {
+                    println!("Media roundtrip mismatch: uploaded and downloaded bytes differ.");
+                }
+            }
         }
 
         Ok(())
@@ -223,6 +290,50 @@ async fn wait_for_send_ack(
             } else {
                 let code = ack.error_code.unwrap_or_else(|| "unknown".to_owned());
                 Some(Err(format!("send failed with error code: {code}")))
+            }
+        }
+        BackendEvent::FatalError { code, message, .. } => {
+            Some(Err(format!("fatal backend error ({code}): {message}")))
+        }
+        _ => None,
+    })
+    .await
+}
+
+async fn wait_for_media_upload_ack(
+    events: &mut EventStream,
+    client_txn_id: &str,
+) -> Result<String, String> {
+    wait_for_event(events, "media upload ack", |event| match event {
+        BackendEvent::MediaUploadAck(ack) if ack.client_txn_id == client_txn_id => {
+            if let Some(content_uri) = ack.content_uri {
+                Some(Ok(content_uri))
+            } else {
+                let code = ack.error_code.unwrap_or_else(|| "unknown".to_owned());
+                Some(Err(format!("media upload failed with error code: {code}")))
+            }
+        }
+        BackendEvent::FatalError { code, message, .. } => {
+            Some(Err(format!("fatal backend error ({code}): {message}")))
+        }
+        _ => None,
+    })
+    .await
+}
+
+async fn wait_for_media_download_ack(
+    events: &mut EventStream,
+    client_txn_id: &str,
+) -> Result<Vec<u8>, String> {
+    wait_for_event(events, "media download ack", |event| match event {
+        BackendEvent::MediaDownloadAck(ack) if ack.client_txn_id == client_txn_id => {
+            if let Some(data) = ack.data {
+                Some(Ok(data))
+            } else {
+                let code = ack.error_code.unwrap_or_else(|| "unknown".to_owned());
+                Some(Err(format!(
+                    "media download failed with error code: {code}"
+                )))
             }
         }
         BackendEvent::FatalError { code, message, .. } => {

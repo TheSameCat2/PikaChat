@@ -71,6 +71,15 @@ pub enum BackendCommand {
         target_event_id: String,
         reason: Option<String>,
     },
+    UploadMedia {
+        client_txn_id: String,
+        content_type: String,
+        data: Vec<u8>,
+    },
+    DownloadMedia {
+        client_txn_id: String,
+        source: String,
+    },
     Logout,
 }
 
@@ -114,6 +123,22 @@ pub struct SendAck {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaUploadAck {
+    pub client_txn_id: String,
+    pub content_uri: Option<String>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MediaDownloadAck {
+    pub client_txn_id: String,
+    pub source: String,
+    pub data: Option<Vec<u8>>,
+    pub content_type: Option<String>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CryptoStatus {
     pub cross_signing_ready: bool,
     pub trusted_devices: u64,
@@ -142,6 +167,8 @@ pub enum BackendEvent {
         items: Vec<TimelineItem>,
     },
     SendAck(SendAck),
+    MediaUploadAck(MediaUploadAck),
+    MediaDownloadAck(MediaDownloadAck),
     CryptoStatus(CryptoStatus),
     FatalError {
         code: String,

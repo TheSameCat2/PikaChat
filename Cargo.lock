@@ -224,6 +224,7 @@ dependencies = [
  "backend-platform",
  "matrix-sdk",
  "matrix-sdk-ui",
+ "mime",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
