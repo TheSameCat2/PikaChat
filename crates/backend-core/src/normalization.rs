@@ -3,12 +3,16 @@ use crate::{
     types::{BackendEvent, SendAck},
 };
 
+/// Internal helper describing send command success/failure before normalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendOutcome {
+    /// Send succeeded and produced an event ID.
     Success { event_id: String },
+    /// Send failed with backend error details.
     Failure { error: BackendError },
 }
 
+/// Convert a send command outcome to a stable `BackendEvent::SendAck`.
 pub fn normalize_send_outcome(
     client_txn_id: impl Into<String>,
     outcome: SendOutcome,
@@ -28,6 +32,7 @@ pub fn normalize_send_outcome(
     }
 }
 
+/// Convert an error into a `FatalError` backend event.
 pub fn normalize_fatal_error(error: BackendError, recoverable: bool) -> BackendEvent {
     BackendEvent::FatalError {
         code: error.code,
@@ -36,6 +41,7 @@ pub fn normalize_fatal_error(error: BackendError, recoverable: bool) -> BackendE
     }
 }
 
+/// Convert a generic send failure message to a default network-classified error.
 pub fn classify_send_error_message(message: impl Into<String>) -> BackendError {
     BackendError::new(BackendErrorCategory::Network, "send_failed", message.into())
 }

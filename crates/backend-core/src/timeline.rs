@@ -2,12 +2,15 @@ use thiserror::Error;
 
 use crate::types::{TimelineItem, TimelineOp};
 
+/// Errors that can occur while applying timeline operations.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum TimelineMergeError {
+    /// An operation referenced an event ID that is not present in the buffer.
     #[error("timeline item with event_id '{0}' was not found")]
     MissingEvent(String),
 }
 
+/// In-memory timeline buffer with bounded item retention.
 #[derive(Debug, Clone)]
 pub struct TimelineBuffer {
     items: Vec<TimelineItem>,
@@ -15,6 +18,7 @@ pub struct TimelineBuffer {
 }
 
 impl TimelineBuffer {
+    /// Create a timeline buffer with an item cap (`max_items >= 1`).
     pub fn new(max_items: usize) -> Self {
         Self {
             items: Vec::new(),
@@ -22,10 +26,12 @@ impl TimelineBuffer {
         }
     }
 
+    /// Current timeline items in display order.
     pub fn items(&self) -> &[TimelineItem] {
         &self.items
     }
 
+    /// Apply timeline operations in order.
     pub fn apply_ops(&mut self, ops: &[TimelineOp]) -> Result<(), TimelineMergeError> {
         for op in ops {
             match op {
@@ -55,6 +61,9 @@ impl TimelineBuffer {
         Ok(())
     }
 
+    /// Clamp a requested pagination limit against safety and server caps.
+    ///
+    /// The result is always in `1..=100`.
     pub fn bounded_paginate_limit(requested: u16, server_cap: u16) -> u16 {
         let safe_requested = requested.max(1);
         let safe_cap = server_cap.max(1);

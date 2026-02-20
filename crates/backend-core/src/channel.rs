@@ -3,14 +3,18 @@ use tokio::sync::{broadcast, mpsc};
 
 use crate::types::{BackendCommand, BackendEvent};
 
+/// Broadcast event stream type used by frontend subscribers.
 pub type EventStream = broadcast::Receiver<BackendEvent>;
 
+/// Errors returned by backend channel operations.
 #[derive(Debug, Error)]
 pub enum BackendChannelError {
+    /// The command receiver side is closed.
     #[error("command channel is closed")]
     CommandChannelClosed,
 }
 
+/// Command/event channel pair used by runtime and frontend bridge layers.
 #[derive(Clone, Debug)]
 pub struct BackendChannels {
     command_tx: mpsc::Sender<BackendCommand>,
@@ -18,6 +22,7 @@ pub struct BackendChannels {
 }
 
 impl BackendChannels {
+    /// Create a new channel set and return it with the command receiver.
     pub fn new(
         command_buffer: usize,
         event_buffer: usize,
@@ -34,18 +39,22 @@ impl BackendChannels {
         )
     }
 
+    /// Clone the command sender.
     pub fn command_sender(&self) -> mpsc::Sender<BackendCommand> {
         self.command_tx.clone()
     }
 
+    /// Clone the event sender.
     pub fn event_sender(&self) -> broadcast::Sender<BackendEvent> {
         self.event_tx.clone()
     }
 
+    /// Subscribe to emitted backend events.
     pub fn subscribe(&self) -> EventStream {
         self.event_tx.subscribe()
     }
 
+    /// Send one command to the runtime.
     pub async fn send_command(&self, command: BackendCommand) -> Result<(), BackendChannelError> {
         self.command_tx
             .send(command)
@@ -53,6 +62,9 @@ impl BackendChannels {
             .map_err(|_| BackendChannelError::CommandChannelClosed)
     }
 
+    /// Emit an event to all subscribers.
+    ///
+    /// Emission is best-effort; lagged subscribers are handled by `broadcast`.
     pub fn emit(&self, event: BackendEvent) {
         let _ = self.event_tx.send(event);
     }

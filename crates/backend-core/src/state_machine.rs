@@ -3,6 +3,7 @@ use crate::{
     types::{BackendCommand, BackendEvent, BackendLifecycleState},
 };
 
+/// Deterministic backend lifecycle transition guard.
 #[derive(Debug, Clone)]
 pub struct BackendStateMachine {
     state: BackendLifecycleState,
@@ -17,10 +18,14 @@ impl Default for BackendStateMachine {
 }
 
 impl BackendStateMachine {
+    /// Current backend lifecycle state.
     pub fn state(&self) -> BackendLifecycleState {
         self.state
     }
 
+    /// Apply a command transition and return state-change events to emit.
+    ///
+    /// Commands that do not transition state may return an empty event vector.
     pub fn apply(&mut self, command: &BackendCommand) -> Result<Vec<BackendEvent>, BackendError> {
         use BackendCommand::*;
 
@@ -75,6 +80,7 @@ impl BackendStateMachine {
         }
     }
 
+    /// Resolve an auth attempt and transition out of `Authenticating`.
     pub fn on_auth_result(&mut self, success: bool) -> Result<BackendEvent, BackendError> {
         if self.state != BackendLifecycleState::Authenticating {
             return Err(BackendError::invalid_state(self.state, "on_auth_result"));
@@ -90,6 +96,7 @@ impl BackendStateMachine {
         Ok(BackendEvent::StateChanged { state: next })
     }
 
+    /// Force state machine into fatal state.
     pub fn on_fatal(&mut self) -> BackendEvent {
         self.state = BackendLifecycleState::Fatal;
         BackendEvent::StateChanged {

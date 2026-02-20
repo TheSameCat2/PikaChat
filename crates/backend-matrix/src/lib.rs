@@ -1,3 +1,10 @@
+//! Matrix SDK-backed backend runtime and frontend adapter implementation.
+//!
+//! The primary frontend-facing entry points are:
+//! - [`spawn_runtime`]
+//! - [`MatrixRuntimeHandle`]
+//! - [`MatrixFrontendAdapter`]
+
 use std::{
     collections::{HashMap, VecDeque},
     fs,
@@ -53,14 +60,19 @@ const REL_TYPE_REPLACE: &str = "m.replace";
 const DEFAULT_TIMELINE_MAX_ITEMS: usize = 500;
 const STORE_PASSPHRASE_FILENAME: &str = ".pikachat-store-passphrase";
 
+/// Configuration for constructing a [`MatrixBackend`] instance.
 #[derive(Debug, Clone)]
 pub struct MatrixBackendConfig {
+    /// Homeserver base URL (for example `https://matrix.example.org`).
     pub homeserver: String,
+    /// Local data directory for the Matrix SDK sqlite store.
     pub data_dir: PathBuf,
+    /// Optional sqlite store passphrase.
     pub store_passphrase: Option<String>,
 }
 
 impl MatrixBackendConfig {
+    /// Build a new backend config.
     pub fn new(
         homeserver: impl Into<String>,
         data_dir: impl Into<PathBuf>,
@@ -80,6 +92,10 @@ struct RunningSyncTask {
     task: JoinHandle<()>,
 }
 
+/// Low-level Matrix SDK backend implementation.
+///
+/// Most frontend integrations should use [`spawn_runtime`] and
+/// [`MatrixFrontendAdapter`] rather than calling this type directly.
 #[derive(Debug)]
 pub struct MatrixBackend {
     client: Client,
@@ -87,6 +103,7 @@ pub struct MatrixBackend {
 }
 
 impl MatrixBackend {
+    /// Construct a backend client and initialize the persistent store.
     pub async fn new(config: MatrixBackendConfig) -> Result<Self, BackendError> {
         let client = Client::builder()
             .homeserver_url(&config.homeserver)
@@ -101,14 +118,17 @@ impl MatrixBackend {
         })
     }
 
+    /// Access the underlying Matrix SDK client.
     pub fn client(&self) -> &Client {
         &self.client
     }
 
+    /// Return the currently active Matrix session, if authenticated.
     pub fn session(&self) -> Option<MatrixSession> {
         self.client.matrix_auth().session()
     }
 
+    /// Restore a previously serialized Matrix session.
     pub async fn restore_session(&self, session: MatrixSession) -> Result<(), BackendError> {
         self.client
             .restore_session(session)
@@ -116,14 +136,17 @@ impl MatrixBackend {
             .map_err(map_matrix_error)
     }
 
+    /// Logout the current account.
     pub async fn logout(&self) -> Result<(), BackendError> {
         self.client.logout().await.map_err(map_matrix_error)
     }
 
+    /// Collect room summaries from the current client state.
     pub fn list_rooms(&self) -> Vec<RoomSummary> {
         collect_room_summaries(&self.client)
     }
 
+    /// Login with password using the Matrix client API.
     pub async fn login_password(
         &self,
         user_id_or_localpart: &str,
@@ -140,6 +163,7 @@ impl MatrixBackend {
             .map_err(map_matrix_error)
     }
 
+    /// Start continuous `/sync` polling and emit events to `event_tx`.
     pub async fn start_sync(
         &self,
         event_tx: broadcast::Sender<BackendEvent>,
@@ -232,6 +256,7 @@ impl MatrixBackend {
         Ok(())
     }
 
+    /// Stop the currently running sync loop.
     pub async fn stop_sync(&self) -> Result<(), BackendError> {
         let running = {
             let mut guard = self.sync_task.lock().await;
@@ -251,6 +276,7 @@ impl MatrixBackend {
         Ok(())
     }
 
+    /// Execute one `/sync` request.
     pub async fn sync_once(&self) -> Result<(), BackendError> {
         self.client
             .sync_once(SyncSettings::default())
@@ -259,6 +285,7 @@ impl MatrixBackend {
             .map_err(map_matrix_error)
     }
 
+    /// Send a room message and return created event ID.
     pub async fn send_message(
         &self,
         room_id: &str,
@@ -277,6 +304,7 @@ impl MatrixBackend {
         Ok(response.event_id.to_string())
     }
 
+    /// Send an edit for an existing room message.
     pub async fn edit_message(
         &self,
         room_id: &str,
@@ -300,6 +328,7 @@ impl MatrixBackend {
         Ok(response.event_id.to_string())
     }
 
+    /// Redact an existing room event.
     pub async fn redact_message(
         &self,
         room_id: &str,
@@ -316,6 +345,7 @@ impl MatrixBackend {
         Ok(())
     }
 
+    /// Fetch initial room history and return timeline operations plus next token.
     pub async fn open_room(
         &self,
         room_id: &str,
@@ -331,6 +361,7 @@ impl MatrixBackend {
         Ok((timeline_ops_for_open(messages), next_token))
     }
 
+    /// Fetch older room history and return prepend operations plus next token.
     pub async fn paginate_back(
         &self,
         room_id: &str,
@@ -347,6 +378,7 @@ impl MatrixBackend {
         Ok((timeline_ops_for_pagination(messages), next_token))
     }
 
+    /// Send a text DM to a user, creating a DM room if needed.
     pub async fn send_dm_text(&self, user_id: &str, body: &str) -> Result<String, BackendError> {
         let user_id = parse_user_id(user_id)?;
 
@@ -366,6 +398,7 @@ impl MatrixBackend {
         Ok(response.event_id.to_string())
     }
 
+    /// Upload raw media bytes and return the resulting `mxc://` URI string.
     pub async fn upload_media(
         &self,
         content_type: &str,
@@ -381,6 +414,7 @@ impl MatrixBackend {
         Ok(response.content_uri.to_string())
     }
 
+    /// Download media bytes from an `mxc://` source.
     pub async fn download_media(&self, source: &str) -> Result<Vec<u8>, BackendError> {
         let source = parse_mxc_uri(source)?;
         let request = MediaRequestParameters {
@@ -560,21 +594,25 @@ impl RuntimeBackend for MatrixBackend {
     }
 }
 
+/// Handle for interacting with the spawned backend runtime task.
 #[derive(Clone, Debug)]
 pub struct MatrixRuntimeHandle {
     channels: BackendChannels,
 }
 
 impl MatrixRuntimeHandle {
+    /// Send one command to the backend runtime.
     pub async fn send(&self, command: BackendCommand) -> Result<(), BackendChannelError> {
         self.channels.send_command(command).await
     }
 
+    /// Subscribe to backend events.
     pub fn subscribe(&self) -> EventStream {
         self.channels.subscribe()
     }
 }
 
+/// Spawn the Matrix runtime task and return a handle.
 pub fn spawn_runtime() -> MatrixRuntimeHandle {
     let (channels, command_rx) = BackendChannels::new(128, 512);
     let runtime = MatrixRuntime::new(channels.clone(), command_rx);
@@ -585,10 +623,12 @@ pub fn spawn_runtime() -> MatrixRuntimeHandle {
     MatrixRuntimeHandle { channels }
 }
 
+/// Opaque ID returned when queuing commands in [`MatrixFrontendAdapter`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FrontendCommandId(u64);
 
 impl FrontendCommandId {
+    /// Raw numeric value of this command ID.
     pub fn value(self) -> u64 {
         self.0
     }
@@ -600,6 +640,8 @@ struct QueuedFrontendCommand {
     command: BackendCommand,
 }
 
+/// Frontend-oriented wrapper around runtime handle with command queueing and
+/// timeline snapshot convenience events.
 #[derive(Debug)]
 pub struct MatrixFrontendAdapter {
     runtime: MatrixRuntimeHandle,
@@ -613,14 +655,19 @@ pub struct MatrixFrontendAdapter {
 }
 
 impl MatrixFrontendAdapter {
+    /// Create an adapter with default buffer sizes.
     pub fn new(runtime: MatrixRuntimeHandle) -> Self {
         Self::with_config(runtime, 512, DEFAULT_TIMELINE_MAX_ITEMS)
     }
 
+    /// Create an adapter with custom event channel buffer size.
     pub fn with_event_buffer(runtime: MatrixRuntimeHandle, event_buffer: usize) -> Self {
         Self::with_config(runtime, event_buffer, DEFAULT_TIMELINE_MAX_ITEMS)
     }
 
+    /// Create an adapter with full custom configuration.
+    ///
+    /// `timeline_max_items` is clamped to at least `1`.
     pub fn with_config(
         runtime: MatrixRuntimeHandle,
         event_buffer: usize,
@@ -682,10 +729,15 @@ impl MatrixFrontendAdapter {
         }
     }
 
+    /// Subscribe to adapter events.
+    ///
+    /// This stream includes runtime events and adapter-generated
+    /// `RoomTimelineSnapshot` events.
     pub fn subscribe(&self) -> EventStream {
         self.event_tx.subscribe()
     }
 
+    /// Queue a command for later flush to runtime.
     pub fn enqueue(&self, command: BackendCommand) -> FrontendCommandId {
         let id = FrontendCommandId(self.next_command_id.fetch_add(1, Ordering::Relaxed));
         self.queue
@@ -695,6 +747,9 @@ impl MatrixFrontendAdapter {
         id
     }
 
+    /// Cancel a queued command by ID.
+    ///
+    /// Returns `true` if a queued item was removed.
     pub fn cancel(&self, command_id: FrontendCommandId) -> bool {
         let mut queue = self
             .queue
@@ -708,6 +763,7 @@ impl MatrixFrontendAdapter {
         }
     }
 
+    /// Number of currently queued commands.
     pub fn queued_len(&self) -> usize {
         self.queue
             .lock()
@@ -715,6 +771,7 @@ impl MatrixFrontendAdapter {
             .len()
     }
 
+    /// Return current in-memory snapshot for a room.
     pub fn timeline_snapshot(&self, room_id: &str) -> Vec<TimelineItem> {
         self.timelines
             .lock()
@@ -724,10 +781,14 @@ impl MatrixFrontendAdapter {
             .unwrap_or_default()
     }
 
+    /// Maximum retained timeline items per room snapshot.
     pub fn timeline_max_items(&self) -> usize {
         self.timeline_max_items
     }
 
+    /// Flush one queued command to runtime.
+    ///
+    /// Returns `Ok(None)` when queue is empty.
     pub async fn flush_one(&self) -> Result<Option<FrontendCommandId>, BackendChannelError> {
         let maybe_command = self
             .queue
@@ -750,6 +811,9 @@ impl MatrixFrontendAdapter {
         Ok(Some(queued.id))
     }
 
+    /// Flush all currently queued commands.
+    ///
+    /// Returns number of commands successfully sent.
     pub async fn flush_all(&self) -> Result<usize, BackendChannelError> {
         let mut count = 0;
         while self.flush_one().await?.is_some() {
@@ -758,6 +822,7 @@ impl MatrixFrontendAdapter {
         Ok(count)
     }
 
+    /// Stop adapter background tasks and consume the adapter.
     pub async fn shutdown(self) {
         self.stop.cancel();
         let _ = self.event_task.await;

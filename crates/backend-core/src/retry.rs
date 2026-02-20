@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+/// Exponential backoff policy for retryable operations.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryPolicy {
     base_delay_ms: u64,
@@ -7,6 +8,7 @@ pub struct RetryPolicy {
 }
 
 impl RetryPolicy {
+    /// Create a retry policy with explicit base and max delays in milliseconds.
     pub fn new(base_delay_ms: u64, max_delay_ms: u64) -> Self {
         Self {
             base_delay_ms,
@@ -14,14 +16,17 @@ impl RetryPolicy {
         }
     }
 
+    /// Base retry delay in milliseconds.
     pub fn base_delay_ms(&self) -> u64 {
         self.base_delay_ms
     }
 
+    /// Maximum retry delay in milliseconds.
     pub fn max_delay_ms(&self) -> u64 {
         self.max_delay_ms
     }
 
+    /// Compute retry delay for attempt index, honoring an optional server hint.
     pub fn delay_for_attempt(&self, attempt: u32, retry_after_hint_ms: Option<u64>) -> Duration {
         let shift = attempt.min(20);
         let multiplier = 1_u64 << shift;
