@@ -13,6 +13,6 @@ pub use retry::RetryPolicy;
 pub use state_machine::BackendStateMachine;
 pub use timeline::{TimelineBuffer, TimelineMergeError};
 pub use types::{
-    BackendCommand, BackendEvent, BackendLifecycleState, CryptoStatus, MessageType, RoomSummary,
-    SendAck, SyncStatus, TimelineItem, TimelineOp,
+    BackendCommand, BackendEvent, BackendInitConfig, BackendLifecycleState, CryptoStatus,
+    MessageType, RoomSummary, SendAck, SyncStatus, TimelineItem, TimelineOp,
 };

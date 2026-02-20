@@ -152,6 +152,7 @@ mod tests {
         BackendCommand::Init {
             homeserver: "https://matrix.example.org".to_owned(),
             data_dir: PathBuf::from("/tmp/pikachat"),
+            config: None,
         }
     }
 

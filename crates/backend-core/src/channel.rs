@@ -72,6 +72,7 @@ mod tests {
             .send_command(crate::types::BackendCommand::Init {
                 homeserver: "https://matrix.example.org".into(),
                 data_dir: PathBuf::from("/tmp/store"),
+                config: None,
             })
             .await
             .expect("command send should work");

@@ -9,6 +9,7 @@ use backend_matrix::spawn_runtime;
 use tokio::{sync::broadcast, time::timeout};
 
 const EVENT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_SYNC_OBSERVE_SECS: u64 = 8;
 
 #[tokio::main]
 async fn main() {
@@ -34,6 +35,7 @@ async fn run() -> Result<(), String> {
         BackendCommand::Init {
             homeserver: homeserver.clone(),
             data_dir,
+            config: None,
         },
         "Init",
     )
@@ -64,12 +66,38 @@ async fn run() -> Result<(), String> {
         println!("Set PIKACHAT_USER and PIKACHAT_PASSWORD to run live auth smoke.");
         println!("Optional: set PIKACHAT_DM_TARGET to send a DM smoke message.");
         println!("Optional: set PIKACHAT_RESTORE_SESSION=1 to try keyring session restore.");
+        println!("Optional: set PIKACHAT_START_SYNC=1 to exercise StartSync/StopSync.");
         return Ok(());
     }
 
     send_command(&runtime, BackendCommand::ListRooms, "ListRooms").await?;
     let rooms = wait_for_room_list(&mut events).await?;
     println!("Loaded {rooms} rooms from backend.");
+
+    if env_truthy("PIKACHAT_START_SYNC") {
+        send_command(&runtime, BackendCommand::StartSync, "StartSync").await?;
+        wait_for_state(&mut events, BackendLifecycleState::Syncing, "syncing").await?;
+        println!("Sync started.");
+
+        let observe_secs = env::var("PIKACHAT_SYNC_OBSERVE_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SYNC_OBSERVE_SECS);
+        let stats = observe_sync_events(&mut events, Duration::from_secs(observe_secs)).await?;
+        println!(
+            "Observed sync for {}s: room_list_updates={}, timeline_deltas={}",
+            observe_secs, stats.room_list_updates, stats.timeline_deltas
+        );
+
+        send_command(&runtime, BackendCommand::StopSync, "StopSync").await?;
+        wait_for_state(
+            &mut events,
+            BackendLifecycleState::Authenticated,
+            "authenticated after stop sync",
+        )
+        .await?;
+        println!("Sync stopped.");
+    }
 
     if let Some(dm_target) = env::var("PIKACHAT_DM_TARGET").ok() {
         let dm_body = env::var("PIKACHAT_DM_BODY")
@@ -171,6 +199,48 @@ async fn wait_for_send_ack(
         _ => None,
     })
     .await
+}
+
+#[derive(Debug, Default)]
+struct SyncObserveStats {
+    room_list_updates: usize,
+    timeline_deltas: usize,
+}
+
+async fn observe_sync_events(
+    events: &mut EventStream,
+    duration: Duration,
+) -> Result<SyncObserveStats, String> {
+    let deadline = tokio::time::Instant::now() + duration;
+    let mut stats = SyncObserveStats::default();
+
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+
+        let event = match timeout(remaining, recv_event(events)).await {
+            Ok(result) => result?,
+            Err(_) => break,
+        };
+
+        match event {
+            BackendEvent::RoomListUpdated { .. } => {
+                stats.room_list_updates += 1;
+            }
+            BackendEvent::RoomTimelineDelta { .. } => {
+                stats.timeline_deltas += 1;
+            }
+            BackendEvent::FatalError { code, message, .. } => {
+                return Err(format!("fatal backend error ({code}): {message}"));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(stats)
 }
 
 async fn wait_for_event<T, F>(

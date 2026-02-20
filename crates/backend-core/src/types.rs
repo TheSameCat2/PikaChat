@@ -20,11 +20,19 @@ pub enum MessageType {
     Emote,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct BackendInitConfig {
+    pub sync_request_timeout_ms: Option<u64>,
+    pub default_open_room_limit: Option<u16>,
+    pub pagination_limit_cap: Option<u16>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BackendCommand {
     Init {
         homeserver: String,
         data_dir: PathBuf,
+        config: Option<BackendInitConfig>,
     },
     LoginPassword {
         user_id_or_localpart: String,

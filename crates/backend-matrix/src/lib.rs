@@ -1,16 +1,17 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 
 use backend_core::{
     BackendChannelError, BackendChannels, BackendCommand, BackendError, BackendErrorCategory,
-    BackendEvent, BackendLifecycleState, BackendStateMachine, EventStream, MessageType,
-    RetryPolicy, RoomSummary, SendOutcome, SyncStatus, TimelineBuffer, TimelineItem, TimelineOp,
-    classify_http_status, normalize_send_outcome,
+    BackendEvent, BackendInitConfig, BackendLifecycleState, BackendStateMachine, EventStream,
+    MessageType, RetryPolicy, RoomSummary, SendOutcome, SyncStatus, TimelineBuffer, TimelineItem,
+    TimelineOp, classify_http_status, normalize_send_outcome,
 };
 use backend_platform::{OsKeyringSecretStore, ScopedSecretStore, SecretStoreError};
 use matrix_sdk::{
     Client, ClientBuildError, HttpError,
     authentication::matrix::MatrixSession,
     config::SyncSettings,
+    deserialized_responses::TimelineEvent,
     room::{Messages, MessagesOptions, edit::EditedContent},
     ruma::{
         OwnedEventId, OwnedRoomId, OwnedUserId, UInt,
@@ -30,7 +31,7 @@ const STORE_PASSPHRASE_KEY_PREFIX: &str = "store-passphrase";
 const SESSION_KEY_PREFIX: &str = "matrix-session";
 const DEFAULT_DEVICE_DISPLAY_NAME: &str = "PikaChat Desktop";
 const DEFAULT_OPEN_ROOM_LIMIT: u16 = 30;
-const SERVER_PAGINATION_LIMIT_CAP: u16 = 100;
+const DEFAULT_PAGINATION_LIMIT_CAP: u16 = 100;
 
 #[derive(Debug, Clone)]
 pub struct MatrixBackendConfig {
@@ -122,6 +123,7 @@ impl MatrixBackend {
     pub async fn start_sync(
         &self,
         event_tx: broadcast::Sender<BackendEvent>,
+        sync_request_timeout: Option<Duration>,
     ) -> Result<(), BackendError> {
         let mut guard = self.sync_task.lock().await;
         if guard.is_some() {
@@ -144,7 +146,10 @@ impl MatrixBackend {
 
             let retry_policy = RetryPolicy::default();
             let mut attempt: u32 = 0;
-            let mut sync_settings = SyncSettings::default();
+            let mut sync_settings = match sync_request_timeout {
+                Some(timeout) => SyncSettings::default().timeout(timeout),
+                None => SyncSettings::default(),
+            };
 
             loop {
                 tokio::select! {
@@ -153,6 +158,12 @@ impl MatrixBackend {
                         match sync_result {
                             Ok(sync_response) => {
                                 attempt = 0;
+                                for (room_id, ops) in sync_timeline_deltas(&sync_response) {
+                                    let _ = event_tx_clone.send(BackendEvent::RoomTimelineDelta {
+                                        room_id,
+                                        ops,
+                                    });
+                                }
                                 sync_settings = sync_settings.token(sync_response.next_batch);
                                 let rooms = collect_room_summaries(&client);
                                 let _ = event_tx_clone.send(BackendEvent::RoomListUpdated { rooms });
@@ -377,12 +388,30 @@ struct RuntimeInitState {
     session_account: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RuntimeTuning {
+    sync_request_timeout: Option<Duration>,
+    open_room_limit: u16,
+    pagination_limit_cap: u16,
+}
+
+impl Default for RuntimeTuning {
+    fn default() -> Self {
+        Self {
+            sync_request_timeout: None,
+            open_room_limit: DEFAULT_OPEN_ROOM_LIMIT,
+            pagination_limit_cap: DEFAULT_PAGINATION_LIMIT_CAP,
+        }
+    }
+}
+
 struct MatrixRuntime {
     channels: BackendChannels,
     command_rx: mpsc::Receiver<BackendCommand>,
     state_machine: BackendStateMachine,
     backend: Option<Arc<MatrixBackend>>,
     init_state: Option<RuntimeInitState>,
+    runtime_tuning: RuntimeTuning,
     pagination_tokens: HashMap<String, Option<String>>,
     keyring: ScopedSecretStore<OsKeyringSecretStore>,
 }
@@ -395,6 +424,7 @@ impl MatrixRuntime {
             state_machine: BackendStateMachine::default(),
             backend: None,
             init_state: None,
+            runtime_tuning: RuntimeTuning::default(),
             pagination_tokens: HashMap::new(),
             keyring: ScopedSecretStore::new(OsKeyringSecretStore, KEYRING_SERVICE),
         }
@@ -421,7 +451,8 @@ impl MatrixRuntime {
             BackendCommand::Init {
                 homeserver,
                 data_dir,
-            } => self.handle_init(homeserver, data_dir).await,
+                config,
+            } => self.handle_init(homeserver, data_dir, config).await,
             BackendCommand::LoginPassword {
                 user_id_or_localpart,
                 password,
@@ -485,11 +516,15 @@ impl MatrixRuntime {
         &mut self,
         homeserver: String,
         data_dir: PathBuf,
+        config: Option<BackendInitConfig>,
     ) -> Result<(), BackendError> {
         let (candidate, transition_events) = self.validate_transition(BackendCommand::Init {
             homeserver: String::new(),
             data_dir: PathBuf::new(),
+            config: None,
         })?;
+
+        let runtime_tuning = runtime_tuning_from_init_config(config)?;
 
         let passphrase_account = store_passphrase_account_for_homeserver(&homeserver);
         let session_account = session_account_for_homeserver(&homeserver);
@@ -506,6 +541,7 @@ impl MatrixRuntime {
 
         self.backend = Some(backend);
         self.init_state = Some(RuntimeInitState { session_account });
+        self.runtime_tuning = runtime_tuning;
         self.pagination_tokens.clear();
 
         self.commit_transition(candidate, transition_events);
@@ -602,7 +638,12 @@ impl MatrixRuntime {
     async fn handle_start_sync(&mut self) -> Result<(), BackendError> {
         let (candidate, transition_events) = self.validate_transition(BackendCommand::StartSync)?;
         let backend = self.require_backend()?;
-        backend.start_sync(self.channels.event_sender()).await?;
+        backend
+            .start_sync(
+                self.channels.event_sender(),
+                self.runtime_tuning.sync_request_timeout,
+            )
+            .await?;
         self.commit_transition(candidate, transition_events);
         Ok(())
     }
@@ -629,7 +670,9 @@ impl MatrixRuntime {
         })?;
         let backend = self.require_backend()?;
 
-        let (ops, next_token) = backend.open_room(&room_id, DEFAULT_OPEN_ROOM_LIMIT).await?;
+        let (ops, next_token) = backend
+            .open_room(&room_id, self.runtime_tuning.open_room_limit)
+            .await?;
         self.pagination_tokens.insert(room_id.clone(), next_token);
         self.channels
             .emit(BackendEvent::RoomTimelineDelta { room_id, ops });
@@ -653,7 +696,7 @@ impl MatrixRuntime {
             .get(&room_id)
             .and_then(|token| token.as_deref());
         let bounded_limit =
-            TimelineBuffer::bounded_paginate_limit(limit, SERVER_PAGINATION_LIMIT_CAP);
+            TimelineBuffer::bounded_paginate_limit(limit, self.runtime_tuning.pagination_limit_cap);
 
         let (ops, next_token) = backend
             .paginate_back(&room_id, from_token, bounded_limit)
@@ -1010,6 +1053,52 @@ fn session_account_for_homeserver(homeserver: &str) -> String {
     format!("{SESSION_KEY_PREFIX}:{homeserver}")
 }
 
+fn runtime_tuning_from_init_config(
+    config: Option<BackendInitConfig>,
+) -> Result<RuntimeTuning, BackendError> {
+    let config = config.unwrap_or_default();
+
+    let sync_request_timeout = match config.sync_request_timeout_ms {
+        Some(0) => {
+            return Err(BackendError::new(
+                BackendErrorCategory::Config,
+                "invalid_init_config",
+                "sync_request_timeout_ms must be greater than zero when provided",
+            ));
+        }
+        Some(timeout_ms) => Some(Duration::from_millis(timeout_ms)),
+        None => None,
+    };
+
+    let open_room_limit = config
+        .default_open_room_limit
+        .unwrap_or(DEFAULT_OPEN_ROOM_LIMIT);
+    if open_room_limit == 0 {
+        return Err(BackendError::new(
+            BackendErrorCategory::Config,
+            "invalid_init_config",
+            "default_open_room_limit must be greater than zero when provided",
+        ));
+    }
+
+    let pagination_limit_cap = config
+        .pagination_limit_cap
+        .unwrap_or(DEFAULT_PAGINATION_LIMIT_CAP);
+    if pagination_limit_cap == 0 {
+        return Err(BackendError::new(
+            BackendErrorCategory::Config,
+            "invalid_init_config",
+            "pagination_limit_cap must be greater than zero when provided",
+        ));
+    }
+
+    Ok(RuntimeTuning {
+        sync_request_timeout,
+        open_room_limit,
+        pagination_limit_cap,
+    })
+}
+
 fn messages_options(from_token: Option<&str>, limit: u16) -> Result<MessagesOptions, BackendError> {
     let mut options = MessagesOptions::backward();
     options.from = from_token.map(ToOwned::to_owned);
@@ -1041,6 +1130,34 @@ fn timeline_ops_for_pagination(messages: Messages) -> Vec<TimelineOp> {
         }
     }
     ops
+}
+
+fn timeline_ops_for_sync_events(events: &[TimelineEvent], limited: bool) -> Vec<TimelineOp> {
+    let mut ops = Vec::new();
+    if limited {
+        ops.push(TimelineOp::Clear);
+    }
+    for event in events {
+        if let Some(item) = timeline_item_from_event(event) {
+            ops.push(TimelineOp::Append(item));
+        }
+    }
+    ops
+}
+
+fn sync_timeline_deltas(
+    sync_response: &matrix_sdk::sync::SyncResponse,
+) -> Vec<(String, Vec<TimelineOp>)> {
+    let mut deltas = Vec::new();
+
+    for (room_id, update) in &sync_response.rooms.joined {
+        let ops = timeline_ops_for_sync_events(&update.timeline.events, update.timeline.limited);
+        if !ops.is_empty() {
+            deltas.push((room_id.to_string(), ops));
+        }
+    }
+
+    deltas
 }
 
 fn timeline_item_from_event(
@@ -1208,8 +1325,31 @@ fn map_client_build_error(err: ClientBuildError) -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use matrix_sdk::ruma::{events::AnySyncTimelineEvent, serde::Raw};
     use std::{env, time::Duration};
     use tokio::time::timeout;
+
+    fn make_sync_timeline_event(
+        event_id: &str,
+        sender: &str,
+        body: &str,
+        origin_server_ts: u64,
+    ) -> TimelineEvent {
+        let json = serde_json::json!({
+            "type": "m.room.message",
+            "event_id": event_id,
+            "sender": sender,
+            "origin_server_ts": origin_server_ts,
+            "content": {
+                "msgtype": "m.text",
+                "body": body
+            }
+        });
+
+        let raw = Raw::<AnySyncTimelineEvent>::from_json_string(json.to_string())
+            .expect("timeline event json should parse");
+        TimelineEvent::from_plaintext(raw)
+    }
 
     #[test]
     fn rejects_invalid_room_id() {
@@ -1230,6 +1370,42 @@ mod tests {
     }
 
     #[test]
+    fn sync_timeline_ops_append_events_in_order() {
+        let first = make_sync_timeline_event("$e1:example.org", "@alice:example.org", "first", 1);
+        let second = make_sync_timeline_event("$e2:example.org", "@bob:example.org", "second", 2);
+        let ops = timeline_ops_for_sync_events(&[first, second], false);
+
+        assert_eq!(ops.len(), 2);
+        match &ops[0] {
+            TimelineOp::Append(item) => {
+                assert_eq!(item.event_id.as_deref(), Some("$e1:example.org"));
+                assert_eq!(item.sender, "@alice:example.org");
+                assert_eq!(item.body, "first");
+                assert_eq!(item.timestamp_ms, 1);
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
+        match &ops[1] {
+            TimelineOp::Append(item) => {
+                assert_eq!(item.event_id.as_deref(), Some("$e2:example.org"));
+                assert_eq!(item.sender, "@bob:example.org");
+                assert_eq!(item.body, "second");
+                assert_eq!(item.timestamp_ms, 2);
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_timeline_ops_insert_clear_when_limited() {
+        let event = make_sync_timeline_event("$e3:example.org", "@alice:example.org", "hello", 3);
+        let ops = timeline_ops_for_sync_events(&[event], true);
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0], TimelineOp::Clear));
+        assert!(matches!(ops[1], TimelineOp::Append(_)));
+    }
+
+    #[test]
     fn keyring_account_keys_are_stable() {
         assert_eq!(
             store_passphrase_account_for_homeserver("https://matrix.example.org"),
@@ -1239,6 +1415,41 @@ mod tests {
             session_account_for_homeserver("https://matrix.example.org"),
             "matrix-session:https://matrix.example.org"
         );
+    }
+
+    #[test]
+    fn runtime_tuning_defaults_when_init_config_is_absent() {
+        let tuning = runtime_tuning_from_init_config(None).expect("defaults should apply");
+        assert_eq!(tuning.sync_request_timeout, None);
+        assert_eq!(tuning.open_room_limit, DEFAULT_OPEN_ROOM_LIMIT);
+        assert_eq!(tuning.pagination_limit_cap, DEFAULT_PAGINATION_LIMIT_CAP);
+    }
+
+    #[test]
+    fn runtime_tuning_rejects_zero_values() {
+        let err = runtime_tuning_from_init_config(Some(BackendInitConfig {
+            sync_request_timeout_ms: Some(0),
+            default_open_room_limit: None,
+            pagination_limit_cap: None,
+        }))
+        .expect_err("zero timeout must fail");
+        assert_eq!(err.code, "invalid_init_config");
+
+        let err = runtime_tuning_from_init_config(Some(BackendInitConfig {
+            sync_request_timeout_ms: None,
+            default_open_room_limit: Some(0),
+            pagination_limit_cap: None,
+        }))
+        .expect_err("zero open-room limit must fail");
+        assert_eq!(err.code, "invalid_init_config");
+
+        let err = runtime_tuning_from_init_config(Some(BackendInitConfig {
+            sync_request_timeout_ms: None,
+            default_open_room_limit: None,
+            pagination_limit_cap: Some(0),
+        }))
+        .expect_err("zero pagination cap must fail");
+        assert_eq!(err.code, "invalid_init_config");
     }
 
     #[test]
