@@ -2,6 +2,7 @@ mod auth_profile;
 mod bridge;
 mod config;
 mod logging;
+mod media_cache;
 mod state;
 
 use std::sync::Arc;
@@ -151,6 +152,36 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             {
                 let bridge = Arc::clone(&spawned_bridge);
+                ui.on_attachment_pick_requested(move || {
+                    bridge.pick_attachment();
+                });
+            }
+            {
+                let bridge = Arc::clone(&spawned_bridge);
+                ui.on_attachment_clear_requested(move || {
+                    bridge.clear_attachment();
+                });
+            }
+            {
+                let bridge = Arc::clone(&spawned_bridge);
+                ui.on_media_retry_requested(move |source| {
+                    bridge.retry_media_download(source.to_string());
+                });
+            }
+            {
+                let bridge = Arc::clone(&spawned_bridge);
+                ui.on_outgoing_media_retry_requested(move |local_id| {
+                    bridge.retry_outgoing_media(local_id.to_string());
+                });
+            }
+            {
+                let bridge = Arc::clone(&spawned_bridge);
+                ui.on_outgoing_media_remove_requested(move |local_id| {
+                    bridge.remove_outgoing_media(local_id.to_string());
+                });
+            }
+            {
+                let bridge = Arc::clone(&spawned_bridge);
                 ui.on_timeline_scrolled(move |viewport_y| {
                     trace!(viewport_y, "timeline scrolled");
                     bridge.on_timeline_scrolled(viewport_y);
@@ -220,6 +251,11 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.on_room_invite_accept_requested(|_| {});
             ui.on_room_invite_reject_requested(|_| {});
             ui.on_send_message_requested(|_| false);
+            ui.on_attachment_pick_requested(|| {});
+            ui.on_attachment_clear_requested(|| {});
+            ui.on_media_retry_requested(|_| {});
+            ui.on_outgoing_media_retry_requested(|_| {});
+            ui.on_outgoing_media_remove_requested(|_| {});
             ui.on_timeline_scrolled(|_| {});
             ui.on_security_status_requested(|| {});
             ui.on_backup_identity_requested(|| {});
@@ -275,11 +311,27 @@ fn apply_snapshot_to_ui(ui: &MainWindow, snapshot: DesktopSnapshot) {
     let messages = snapshot
         .messages
         .into_iter()
-        .map(|message| MessageRow {
-            event_id: message.event_id.unwrap_or_default().into(),
-            sender: message.sender.into(),
-            body: message.body.into(),
-            is_own: message.is_own,
+        .map(|message| {
+            let media_image = message
+                .media_cached_path
+                .as_deref()
+                .and_then(|path| slint::Image::load_from_path(std::path::Path::new(path)).ok());
+            MessageRow {
+                event_id: message.event_id.unwrap_or_default().into(),
+                local_id: message.local_id.unwrap_or_default().into(),
+                sender: message.sender.into(),
+                body: message.body.into(),
+                event_kind: message.event_kind.into(),
+                caption: message.caption.into(),
+                media_status: message.media_status.into(),
+                media_source: message.media_source.unwrap_or_default().into(),
+                media_cached_path: message.media_cached_path.unwrap_or_default().into(),
+                has_media_image: media_image.is_some(),
+                media_image: media_image.unwrap_or_default(),
+                can_retry: message.can_retry,
+                can_remove: message.can_remove,
+                is_own: message.is_own,
+            }
         })
         .collect::<Vec<_>>();
 
@@ -299,6 +351,13 @@ fn apply_snapshot_to_ui(ui: &MainWindow, snapshot: DesktopSnapshot) {
     ui.set_login_remember_password(snapshot.login_remember_password);
     ui.set_login_in_flight(snapshot.login_in_flight);
     ui.set_show_logout_confirm(snapshot.show_logout_confirm);
+    if let Some(attachment) = snapshot.composer_attachment {
+        ui.set_composer_attachment_name(attachment.file_name.into());
+        ui.set_has_composer_attachment(true);
+    } else {
+        ui.set_composer_attachment_name("".into());
+        ui.set_has_composer_attachment(false);
+    }
     ui.set_show_security_screen(snapshot.show_security_dialog);
     ui.set_security_title(snapshot.security_dialog_title.into());
     ui.set_security_body(snapshot.security_dialog_body.into());
