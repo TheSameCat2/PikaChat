@@ -32,6 +32,24 @@ pub enum MessageType {
     Emote,
 }
 
+/// Membership classification for room-list entries.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RoomMembership {
+    /// The user has joined the room.
+    Joined,
+    /// The user has a pending invite for the room.
+    Invited,
+}
+
+/// Invite action requested by the frontend.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum InviteAction {
+    /// Accept a pending room invite.
+    Accept,
+    /// Reject a pending room invite.
+    Reject,
+}
+
 /// Optional runtime tuning values supplied with `BackendCommand::Init`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct BackendInitConfig {
@@ -72,6 +90,20 @@ pub enum BackendCommand {
     StopSync,
     /// Emit latest room list snapshot.
     ListRooms,
+    /// Accept a pending room invite.
+    AcceptRoomInvite {
+        /// Target room ID.
+        room_id: String,
+        /// Frontend-provided transaction ID echoed in `InviteActionAck`.
+        client_txn_id: String,
+    },
+    /// Reject a pending room invite.
+    RejectRoomInvite {
+        /// Target room ID.
+        room_id: String,
+        /// Frontend-provided transaction ID echoed in `InviteActionAck`.
+        client_txn_id: String,
+    },
     /// Load initial room timeline chunk.
     OpenRoom {
         /// Target room ID.
@@ -194,6 +226,8 @@ pub struct RoomSummary {
     pub highlight_count: u64,
     /// Whether the room is considered a direct message room.
     pub is_direct: bool,
+    /// Current membership classification for this room.
+    pub membership: RoomMembership,
 }
 
 /// Canonical timeline item payload used by timeline snapshots/deltas.
@@ -266,6 +300,19 @@ pub struct MediaDownloadAck {
     pub data: Option<Vec<u8>>,
     /// Optional MIME content type when known.
     pub content_type: Option<String>,
+    /// Stable backend error code on failure.
+    pub error_code: Option<String>,
+}
+
+/// Acknowledgement for invite accept/reject requests.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InviteActionAck {
+    /// Original frontend transaction ID.
+    pub client_txn_id: String,
+    /// Target room ID.
+    pub room_id: String,
+    /// Invite action requested.
+    pub action: InviteAction,
     /// Stable backend error code on failure.
     pub error_code: Option<String>,
 }
@@ -388,6 +435,8 @@ pub enum BackendEvent {
     MediaUploadAck(MediaUploadAck),
     /// Media download acknowledgement.
     MediaDownloadAck(MediaDownloadAck),
+    /// Invite accept/reject acknowledgement.
+    InviteActionAck(InviteActionAck),
     /// Recovery/key-backup status snapshot.
     RecoveryStatus(RecoveryStatus),
     /// Recovery setup acknowledgement.
@@ -405,4 +454,77 @@ pub enum BackendEvent {
         /// Indicates whether retrying may recover.
         recoverable: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn room_summary_carries_membership() {
+        let summary = RoomSummary {
+            room_id: "!abc:example.org".into(),
+            name: Some("Room".into()),
+            unread_notifications: 1,
+            highlight_count: 0,
+            is_direct: false,
+            membership: RoomMembership::Invited,
+        };
+
+        assert_eq!(summary.membership, RoomMembership::Invited);
+    }
+
+    #[test]
+    fn invite_command_variants_include_txn_and_room() {
+        let accept = BackendCommand::AcceptRoomInvite {
+            room_id: "!a:example.org".into(),
+            client_txn_id: "txn-accept".into(),
+        };
+        let reject = BackendCommand::RejectRoomInvite {
+            room_id: "!b:example.org".into(),
+            client_txn_id: "txn-reject".into(),
+        };
+
+        match accept {
+            BackendCommand::AcceptRoomInvite {
+                room_id,
+                client_txn_id,
+            } => {
+                assert_eq!(room_id, "!a:example.org");
+                assert_eq!(client_txn_id, "txn-accept");
+            }
+            _ => panic!("expected AcceptRoomInvite"),
+        }
+
+        match reject {
+            BackendCommand::RejectRoomInvite {
+                room_id,
+                client_txn_id,
+            } => {
+                assert_eq!(room_id, "!b:example.org");
+                assert_eq!(client_txn_id, "txn-reject");
+            }
+            _ => panic!("expected RejectRoomInvite"),
+        }
+    }
+
+    #[test]
+    fn invite_action_ack_event_exposes_contract_fields() {
+        let event = BackendEvent::InviteActionAck(InviteActionAck {
+            client_txn_id: "txn-1".into(),
+            room_id: "!abc:example.org".into(),
+            action: InviteAction::Reject,
+            error_code: Some("not_invited".into()),
+        });
+
+        match event {
+            BackendEvent::InviteActionAck(ack) => {
+                assert_eq!(ack.client_txn_id, "txn-1");
+                assert_eq!(ack.room_id, "!abc:example.org");
+                assert_eq!(ack.action, InviteAction::Reject);
+                assert_eq!(ack.error_code.as_deref(), Some("not_invited"));
+            }
+            _ => panic!("expected InviteActionAck event"),
+        }
+    }
 }

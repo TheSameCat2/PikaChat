@@ -9,6 +9,7 @@ use std::{
 };
 
 use arboard::Clipboard;
+use backend_core::types::InviteAction;
 use backend_core::{BackendCommand, BackendEvent, MessageType};
 use backend_matrix::MatrixFrontendAdapter;
 use tokio::sync::{broadcast, mpsc};
@@ -121,14 +122,36 @@ impl DesktopBridge {
                     }
                 }
 
+                let accepted_invite_room_id = match &event {
+                    BackendEvent::InviteActionAck(ack)
+                        if ack.error_code.is_none() && ack.action == InviteAction::Accept =>
+                    {
+                        Some(ack.room_id.clone())
+                    }
+                    _ => None,
+                };
+
                 let snapshot = {
                     let mut state = state_for_events
                         .lock()
                         .expect("desktop state lock poisoned while handling backend event");
                     state.handle_backend_event(event);
+                    if let Some(room_id) = accepted_invite_room_id.as_ref() {
+                        state.select_room(room_id.clone());
+                    }
                     state.snapshot()
                 };
                 (ui_update_for_events)(snapshot);
+
+                if let Some(room_id) = accepted_invite_room_id {
+                    debug!(%room_id, "invite accepted; opening room timeline");
+                    if command_tx_for_events
+                        .send(room_open_command(room_id))
+                        .is_err()
+                    {
+                        error!("failed to enqueue OpenRoom after invite accept");
+                    }
+                }
             }
             warn!("desktop event worker exiting: backend event stream closed");
         });
@@ -204,6 +227,13 @@ impl DesktopBridge {
                 warn!("send request rejected: no room selected");
                 return false;
             };
+            if !state.can_send_message() {
+                state.set_error_text("Accept this invite before sending messages.");
+                let snapshot = state.snapshot();
+                (self.ui_update)(snapshot);
+                warn!(%room_id, "send request rejected: selected room is not joined");
+                return false;
+            }
 
             let client_txn_id = format!(
                 "desktop-send-{}",
@@ -225,6 +255,16 @@ impl DesktopBridge {
         );
         self.enqueue_command(send_message_command(room_id, client_txn_id, body));
         true
+    }
+
+    /// Accept a room invite by room ID.
+    pub fn accept_room_invite(&self, room_id: String) {
+        self.request_invite_action(room_id, InviteAction::Accept);
+    }
+
+    /// Reject a room invite by room ID.
+    pub fn reject_room_invite(&self, room_id: String) {
+        self.request_invite_action(room_id, InviteAction::Reject);
     }
 
     /// Called by UI scroll updates to trigger near-top pagination.
@@ -458,6 +498,54 @@ impl DesktopBridge {
         );
         (self.ui_update)(snapshot);
     }
+
+    fn request_invite_action(&self, room_id: String, action: InviteAction) {
+        let room_id = room_id.trim().to_owned();
+        if room_id.is_empty() {
+            return;
+        }
+
+        let command = {
+            let mut state = self
+                .state
+                .lock()
+                .expect("desktop state lock poisoned while requesting invite action");
+            if !state.is_invite_room(&room_id) {
+                state.set_error_text("Invite is no longer pending for this room.");
+                let snapshot = state.snapshot();
+                (self.ui_update)(snapshot);
+                return;
+            }
+            if state.has_pending_invite_action(&room_id) {
+                let snapshot = state.snapshot();
+                (self.ui_update)(snapshot);
+                return;
+            }
+
+            let client_txn_id = format!(
+                "desktop-invite-{}-{}",
+                match action {
+                    InviteAction::Accept => "accept",
+                    InviteAction::Reject => "reject",
+                },
+                self.next_txn_id.fetch_add(1, Ordering::Relaxed)
+            );
+            if !state.mark_invite_action_requested(room_id.clone(), client_txn_id.clone(), action) {
+                let snapshot = state.snapshot();
+                (self.ui_update)(snapshot);
+                return;
+            }
+            state.clear_error();
+            let snapshot = state.snapshot();
+            (self.ui_update)(snapshot);
+
+            match action {
+                InviteAction::Accept => accept_room_invite_command(room_id, client_txn_id),
+                InviteAction::Reject => reject_room_invite_command(room_id, client_txn_id),
+            }
+        };
+        self.enqueue_command(command);
+    }
 }
 
 impl Drop for DesktopBridge {
@@ -493,6 +581,20 @@ fn post_auth_command_sequence() -> [BackendCommand; 2] {
 
 fn room_open_command(room_id: String) -> BackendCommand {
     BackendCommand::OpenRoom { room_id }
+}
+
+fn accept_room_invite_command(room_id: String, client_txn_id: String) -> BackendCommand {
+    BackendCommand::AcceptRoomInvite {
+        room_id,
+        client_txn_id,
+    }
+}
+
+fn reject_room_invite_command(room_id: String, client_txn_id: String) -> BackendCommand {
+    BackendCommand::RejectRoomInvite {
+        room_id,
+        client_txn_id,
+    }
 }
 
 fn send_message_command(room_id: String, client_txn_id: String, body: String) -> BackendCommand {
@@ -563,6 +665,8 @@ fn command_kind(command: &BackendCommand) -> &'static str {
         BackendCommand::StartSync => "StartSync",
         BackendCommand::StopSync => "StopSync",
         BackendCommand::ListRooms => "ListRooms",
+        BackendCommand::AcceptRoomInvite { .. } => "AcceptRoomInvite",
+        BackendCommand::RejectRoomInvite { .. } => "RejectRoomInvite",
         BackendCommand::OpenRoom { .. } => "OpenRoom",
         BackendCommand::PaginateBack { .. } => "PaginateBack",
         BackendCommand::SendDmText { .. } => "SendDmText",
@@ -588,6 +692,7 @@ fn event_kind(event: &BackendEvent) -> &'static str {
         BackendEvent::RoomTimelineDelta { .. } => "RoomTimelineDelta",
         BackendEvent::RoomTimelineSnapshot { .. } => "RoomTimelineSnapshot",
         BackendEvent::SendAck(_) => "SendAck",
+        BackendEvent::InviteActionAck(_) => "InviteActionAck",
         BackendEvent::MediaUploadAck(_) => "MediaUploadAck",
         BackendEvent::MediaDownloadAck(_) => "MediaDownloadAck",
         BackendEvent::RecoveryStatus(_) => "RecoveryStatus",
@@ -657,6 +762,26 @@ mod tests {
         assert!(matches!(
             open,
             BackendCommand::OpenRoom { room_id } if room_id == "!room:example.org"
+        ));
+
+        let accept =
+            accept_room_invite_command("!room:example.org".to_owned(), "txn-accept".to_owned());
+        assert!(matches!(
+            accept,
+            BackendCommand::AcceptRoomInvite {
+                room_id,
+                client_txn_id,
+            } if room_id == "!room:example.org" && client_txn_id == "txn-accept"
+        ));
+
+        let reject =
+            reject_room_invite_command("!room:example.org".to_owned(), "txn-reject".to_owned());
+        assert!(matches!(
+            reject,
+            BackendCommand::RejectRoomInvite {
+                room_id,
+                client_txn_id,
+            } if room_id == "!room:example.org" && client_txn_id == "txn-reject"
         ));
 
         let send = send_message_command(

@@ -5,6 +5,7 @@ mod state;
 
 use std::sync::Arc;
 
+use backend_core::types::RoomMembership;
 use backend_matrix::{MatrixFrontendAdapter, spawn_runtime};
 use bridge::{DesktopBridge, UiUpdateCallback};
 use config::DesktopConfig;
@@ -101,6 +102,18 @@ fn main() -> Result<(), slint::PlatformError> {
             }
             {
                 let bridge = Arc::clone(&spawned_bridge);
+                ui.on_room_invite_accept_requested(move |room_id| {
+                    bridge.accept_room_invite(room_id.to_string());
+                });
+            }
+            {
+                let bridge = Arc::clone(&spawned_bridge);
+                ui.on_room_invite_reject_requested(move |room_id| {
+                    bridge.reject_room_invite(room_id.to_string());
+                });
+            }
+            {
+                let bridge = Arc::clone(&spawned_bridge);
                 ui.on_send_message_requested(move |text| {
                     let body = text.to_string();
                     debug!(body_len = body.len(), "send requested from ui");
@@ -173,6 +186,8 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_can_send(false);
 
             ui.on_room_selected(|_| {});
+            ui.on_room_invite_accept_requested(|_| {});
+            ui.on_room_invite_reject_requested(|_| {});
             ui.on_send_message_requested(|_| false);
             ui.on_timeline_scrolled(|_| {});
             ui.on_security_status_requested(|| {});
@@ -220,6 +235,9 @@ fn apply_snapshot_to_ui(ui: &MainWindow, snapshot: DesktopSnapshot) {
             has_unread: room.unread_notifications > 0,
             has_highlight: room.highlight_count > 0,
             is_selected: room.is_selected,
+            is_invite: room.membership == RoomMembership::Invited,
+            invite_pending: room.invite_pending,
+            invite_pending_text: room.invite_pending_text.into(),
         })
         .collect::<Vec<_>>();
 
