@@ -1,6 +1,8 @@
 //! Backend bridge that wires Matrix runtime events into UI state snapshots.
 
 use std::{
+    fs,
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -10,18 +12,28 @@ use std::{
 
 use arboard::Clipboard;
 use backend_core::types::InviteAction;
-use backend_core::{BackendCommand, BackendEvent, MessageType};
+use backend_core::{BackendCommand, BackendEvent, BackendLifecycleState, MessageType};
 use backend_matrix::MatrixFrontendAdapter;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, trace, warn};
+use url::Url;
 
 use crate::{
+    auth_profile::{AuthProfile, clear_auth_profile, load_auth_profile, save_auth_profile},
     config::DesktopConfig,
     state::{DesktopSnapshot, DesktopState},
 };
 
 /// Callback used to publish new UI snapshots.
 pub type UiUpdateCallback = Arc<dyn Fn(DesktopSnapshot) + Send + Sync + 'static>;
+
+#[derive(Debug, Clone)]
+struct AuthSessionIntent {
+    homeserver: String,
+    user_id: String,
+    remember_password: bool,
+    data_dir: PathBuf,
+}
 
 /// Bridges UI actions and backend events using the shared frontend adapter.
 pub struct DesktopBridge {
@@ -33,6 +45,8 @@ pub struct DesktopBridge {
     paginate_limit: u16,
     pagination_top_threshold_px: f32,
     pagination_cooldown_ms: u64,
+    config: DesktopConfig,
+    pending_auth_intent: Arc<Mutex<Option<AuthSessionIntent>>>,
     command_task: tokio::task::JoinHandle<()>,
     event_task: tokio::task::JoinHandle<()>,
 }
@@ -46,17 +60,77 @@ impl DesktopBridge {
         ui_update: UiUpdateCallback,
     ) -> Arc<Self> {
         info!(
-            homeserver = %config.homeserver,
-            user_id = %config.user_id,
-            data_dir = %config.data_dir.display(),
             timeline_max_items = config.timeline_max_items,
             paginate_limit = config.paginate_limit,
             "spawning desktop bridge"
         );
-        let state = Arc::new(Mutex::new(DesktopState::new(
-            config.user_id.clone(),
-            config.timeline_max_items,
-        )));
+
+        let login_profile_path = config.auth_profile_path();
+        let saved_profile = match load_auth_profile(&login_profile_path) {
+            Ok(profile) => profile,
+            Err(err) => {
+                warn!(error = %err, "failed loading auth profile; ignoring persisted profile");
+                None
+            }
+        };
+
+        let prefill_homeserver_raw = saved_profile
+            .as_ref()
+            .map(|profile| profile.homeserver.clone())
+            .or_else(|| config.prefill_homeserver.clone())
+            .unwrap_or_default();
+        let prefill_homeserver = display_homeserver_host(&prefill_homeserver_raw);
+        let prefill_user_id = saved_profile
+            .as_ref()
+            .map(|profile| profile.user_id.clone())
+            .or_else(|| config.prefill_user_id.clone())
+            .unwrap_or_default();
+        let prefill_password = config.prefill_password.clone().unwrap_or_default();
+        let remember_password = saved_profile
+            .as_ref()
+            .map(|profile| profile.remember_password)
+            .unwrap_or(false);
+
+        let startup_restore_intent = saved_profile.as_ref().and_then(|profile| {
+            if !profile.remember_password || profile.user_id.trim().is_empty() {
+                return None;
+            }
+
+            let homeserver = match normalize_homeserver(profile.homeserver.clone()) {
+                Ok(value) => value,
+                Err(err) => {
+                    warn!(
+                        homeserver = %profile.homeserver,
+                        error = %err,
+                        "skipping persisted session restore due invalid homeserver"
+                    );
+                    return None;
+                }
+            };
+
+            Some(AuthSessionIntent {
+                homeserver: homeserver.clone(),
+                user_id: profile.user_id.clone(),
+                remember_password: true,
+                data_dir: config.data_dir_for_account(&homeserver, &profile.user_id),
+            })
+        });
+
+        let mut initial_state =
+            DesktopState::new(prefill_user_id.clone(), config.timeline_max_items);
+        initial_state.set_login_form(
+            prefill_homeserver,
+            prefill_user_id,
+            prefill_password,
+            remember_password,
+        );
+        if startup_restore_intent.is_some() {
+            initial_state.begin_restore_attempt();
+        } else {
+            initial_state.show_login_screen();
+        }
+        let state = Arc::new(Mutex::new(initial_state));
+        let pending_auth_intent = Arc::new(Mutex::new(startup_restore_intent.clone()));
 
         let (command_tx, mut command_rx) = mpsc::unbounded_channel::<BackendCommand>();
         let adapter_for_command_task = Arc::clone(&adapter);
@@ -75,17 +149,12 @@ impl DesktopBridge {
         let state_for_events = Arc::clone(&state);
         let ui_update_for_events = Arc::clone(&ui_update);
         let command_tx_for_events = command_tx.clone();
-        let login_command = login_password_command(&config);
+        let pending_auth_intent_for_events = Arc::clone(&pending_auth_intent);
+        let login_profile_path_for_events = login_profile_path.clone();
+        let config_for_events = config.clone();
         let mut events = adapter.subscribe();
         let event_task = runtime_handle.spawn(async move {
             debug!("desktop event worker started");
-            let mut post_auth_enqueued = false;
-            enum AuthPhase {
-                RestoringSession,
-                LoggingIn,
-                Done,
-            }
-            let mut auth_phase = AuthPhase::RestoringSession;
             loop {
                 let event = match recv_event(&mut events).await {
                     Ok(event) => event,
@@ -93,7 +162,7 @@ impl DesktopBridge {
                 };
                 debug!(event = event_kind(&event), "received backend event");
                 if let BackendEvent::AuthResult { success, .. } = &event {
-                    if *success && !post_auth_enqueued {
+                    if *success {
                         for command in post_auth_command_sequence() {
                             debug!(
                                 command = command_kind(&command),
@@ -104,22 +173,53 @@ impl DesktopBridge {
                                 break;
                             }
                         }
-                        post_auth_enqueued = true;
-                        auth_phase = AuthPhase::Done;
-                    } else if !*success {
-                        if matches!(auth_phase, AuthPhase::RestoringSession) {
-                            debug!(
-                                command = command_kind(&login_command),
-                                "session restore failed; enqueueing password login"
-                            );
-                            if command_tx_for_events.send(login_command.clone()).is_err() {
-                                error!("failed to enqueue fallback password login");
+                        let maybe_intent = pending_auth_intent_for_events
+                            .lock()
+                            .expect("pending auth intent lock poisoned")
+                            .take();
+                        if let Some(intent) = maybe_intent {
+                            if intent.remember_password {
+                                let profile = AuthProfile {
+                                    homeserver: intent.homeserver,
+                                    user_id: intent.user_id,
+                                    remember_password: true,
+                                };
+                                if let Err(err) = save_auth_profile(&login_profile_path_for_events, &profile)
+                                {
+                                    warn!(error = %err, "failed persisting auth profile after successful login");
+                                }
+                            } else if let Err(err) = clear_auth_profile(&login_profile_path_for_events) {
+                                warn!(error = %err, "failed clearing auth profile after non-remembered login");
                             }
-                            auth_phase = AuthPhase::LoggingIn;
-                        } else if matches!(auth_phase, AuthPhase::LoggingIn) {
-                            auth_phase = AuthPhase::Done;
+                        }
+                    } else {
+                        let _ = pending_auth_intent_for_events
+                            .lock()
+                            .expect("pending auth intent lock poisoned")
+                            .take();
+                    }
+                }
+
+                if let BackendEvent::StateChanged {
+                    state: BackendLifecycleState::LoggedOut,
+                } = &event
+                {
+                    if let Err(err) = clear_auth_profile(&login_profile_path_for_events) {
+                        warn!(error = %err, "failed clearing auth profile on logout");
+                    }
+                    for target in config_for_events.logout_wipe_targets() {
+                        if is_dangerous_wipe_target(&target) {
+                            warn!(path = %target.display(), "skipping dangerous logout wipe target");
+                            continue;
+                        }
+                        if let Err(err) = wipe_path_recursive(&target) {
+                            warn!(path = %target.display(), error = %err, "failed wiping logout target");
                         }
                     }
+                    let _ = pending_auth_intent_for_events
+                        .lock()
+                        .expect("pending auth intent lock poisoned")
+                        .take();
                 }
 
                 let accepted_invite_room_id = match &event {
@@ -165,14 +265,21 @@ impl DesktopBridge {
             paginate_limit: config.paginate_limit.max(1),
             pagination_top_threshold_px: config.pagination_top_threshold_px,
             pagination_cooldown_ms: config.pagination_cooldown_ms,
+            config: config.clone(),
+            pending_auth_intent,
             command_task,
             event_task,
         });
 
         bridge.publish_snapshot();
-        for command in startup_command_sequence(&config) {
-            debug!(command = command_kind(&command), "enqueue startup command");
-            bridge.enqueue_command(command);
+        if let Some(intent) = startup_restore_intent {
+            for command in startup_restore_command_sequence(&config, &intent) {
+                debug!(
+                    command = command_kind(&command),
+                    "enqueue startup restore command"
+                );
+                bridge.enqueue_command(command);
+            }
         }
 
         bridge
@@ -203,6 +310,127 @@ impl DesktopBridge {
         } else {
             warn!(index, "room selection ignored: index out of bounds");
         }
+    }
+
+    /// Submit login request from UI login pane.
+    pub fn submit_login(
+        &self,
+        homeserver: String,
+        user_id: String,
+        password: String,
+        remember_password: bool,
+    ) {
+        let user_id = user_id.trim().to_owned();
+        let password = password.trim().to_owned();
+        let homeserver = match normalize_homeserver(homeserver) {
+            Ok(value) => value,
+            Err(err) => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("desktop state lock poisoned while validating homeserver");
+                state.set_error_text(err);
+                state.show_login_screen();
+                let snapshot = state.snapshot();
+                (self.ui_update)(snapshot);
+                return;
+            }
+        };
+
+        if user_id.is_empty() || password.is_empty() {
+            let mut state = self
+                .state
+                .lock()
+                .expect("desktop state lock poisoned while validating login");
+            state.set_error_text("User ID and password are required.");
+            state.show_login_screen();
+            let snapshot = state.snapshot();
+            (self.ui_update)(snapshot);
+            return;
+        }
+
+        let intent = AuthSessionIntent {
+            data_dir: self.config.data_dir_for_account(&homeserver, &user_id),
+            homeserver: homeserver.clone(),
+            user_id: user_id.clone(),
+            remember_password,
+        };
+        *self
+            .pending_auth_intent
+            .lock()
+            .expect("pending auth intent lock poisoned") = Some(intent.clone());
+
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("desktop state lock poisoned while starting manual login");
+            state.begin_manual_login(
+                display_homeserver_host(&homeserver),
+                user_id.clone(),
+                password.clone(),
+                remember_password,
+            );
+            state.clear_error();
+            let snapshot = state.snapshot();
+            (self.ui_update)(snapshot);
+        }
+
+        for command in login_command_sequence(&self.config, &intent, password) {
+            debug!(command = command_kind(&command), "enqueue login command");
+            self.enqueue_command(command);
+        }
+    }
+
+    /// Request logout confirmation from UI.
+    pub fn request_logout_confirmation(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("desktop state lock poisoned while requesting logout confirmation");
+        if state.snapshot().show_login_screen {
+            return;
+        }
+        state.set_logout_confirm_visible(true);
+        let snapshot = state.snapshot();
+        (self.ui_update)(snapshot);
+    }
+
+    /// Cancel logout confirmation dialog.
+    pub fn cancel_logout_confirmation(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("desktop state lock poisoned while cancelling logout confirmation");
+        state.set_logout_confirm_visible(false);
+        let snapshot = state.snapshot();
+        (self.ui_update)(snapshot);
+    }
+
+    /// Confirm logout and enqueue backend logout command.
+    pub fn confirm_logout(&self) {
+        let should_logout = {
+            let state = self
+                .state
+                .lock()
+                .expect("desktop state lock poisoned while checking logout eligibility");
+            !state.snapshot().show_login_screen
+        };
+        if !should_logout {
+            return;
+        }
+
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("desktop state lock poisoned while confirming logout");
+            state.set_logout_confirm_visible(false);
+            state.clear_error();
+            let snapshot = state.snapshot();
+            (self.ui_update)(snapshot);
+        }
+        self.enqueue_command(BackendCommand::Logout);
     }
 
     /// Attempt to send message text to the currently selected room.
@@ -557,22 +785,37 @@ impl Drop for DesktopBridge {
 }
 
 /// Build startup command sequence for initialization and session restore.
-pub fn startup_command_sequence(config: &DesktopConfig) -> Vec<BackendCommand> {
+fn startup_restore_command_sequence(
+    config: &DesktopConfig,
+    intent: &AuthSessionIntent,
+) -> Vec<BackendCommand> {
     vec![
         BackendCommand::Init {
-            homeserver: config.homeserver.clone(),
-            data_dir: config.data_dir.clone(),
+            homeserver: intent.homeserver.clone(),
+            data_dir: intent.data_dir.clone(),
             config: config.init_config.clone(),
         },
         BackendCommand::RestoreSession,
     ]
 }
 
-fn login_password_command(config: &DesktopConfig) -> BackendCommand {
-    BackendCommand::LoginPassword {
-        user_id_or_localpart: config.user_id.clone(),
-        password: config.password.clone(),
-    }
+fn login_command_sequence(
+    config: &DesktopConfig,
+    intent: &AuthSessionIntent,
+    password: String,
+) -> [BackendCommand; 2] {
+    [
+        BackendCommand::Init {
+            homeserver: intent.homeserver.clone(),
+            data_dir: intent.data_dir.clone(),
+            config: config.init_config.clone(),
+        },
+        BackendCommand::LoginPassword {
+            user_id_or_localpart: intent.user_id.clone(),
+            password,
+            persist_session: intent.remember_password,
+        },
+    ]
 }
 
 fn post_auth_command_sequence() -> [BackendCommand; 2] {
@@ -638,6 +881,72 @@ fn recover_secrets_command(client_txn_id: String, recovery_key: String) -> Backe
         client_txn_id,
         recovery_key,
     }
+}
+
+fn normalize_homeserver(raw: String) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("Homeserver is required.".to_owned());
+    }
+
+    let candidate = if let Some(rest) = raw.strip_prefix("https://") {
+        format!("https://{}", rest.trim())
+    } else if let Some(rest) = raw.strip_prefix("http://") {
+        format!("https://{}", rest.trim())
+    } else if raw.contains("://") {
+        return Err("Only secure https homeservers are supported.".to_owned());
+    } else {
+        format!("https://{}", raw)
+    };
+
+    let parsed = Url::parse(&candidate).map_err(|err| format!("Invalid homeserver URL: {err}"))?;
+    if parsed.scheme() != "https" {
+        return Err("Only secure https homeservers are supported.".to_owned());
+    }
+    if parsed.host_str().is_none() {
+        return Err("Homeserver must include a host, for example matrix.example.org.".to_owned());
+    }
+
+    Ok(parsed.as_str().trim_end_matches('/').to_owned())
+}
+
+fn display_homeserver_host(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if let Ok(parsed) = Url::parse(trimmed)
+        && let Some(host) = parsed.host_str()
+    {
+        let mut rendered = host.to_owned();
+        if let Some(port) = parsed.port() {
+            rendered.push(':');
+            rendered.push_str(&port.to_string());
+        }
+        return rendered;
+    }
+
+    let without_scheme = trimmed
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    without_scheme.trim_end_matches('/').to_owned()
+}
+
+fn wipe_path_recursive(path: &PathBuf) -> Result<(), String> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!(
+            "failed removing path {} during logout wipe: {err}",
+            path.display()
+        )),
+    }
+}
+
+fn is_dangerous_wipe_target(path: &PathBuf) -> bool {
+    let value = path.as_os_str().to_string_lossy();
+    value.is_empty() || value == "/" || value == "." || value == ".."
 }
 
 async fn recv_event(events: &mut broadcast::Receiver<BackendEvent>) -> Result<BackendEvent, ()> {
@@ -713,10 +1022,10 @@ mod tests {
 
     fn sample_config() -> DesktopConfig {
         DesktopConfig {
-            homeserver: "https://matrix.example.org".to_owned(),
-            user_id: "@alice:example.org".to_owned(),
-            password: "secret".to_owned(),
-            data_dir: PathBuf::from("/tmp/pika"),
+            prefill_homeserver: Some("https://matrix.example.org".to_owned()),
+            prefill_user_id: Some("@alice:example.org".to_owned()),
+            prefill_password: Some("secret".to_owned()),
+            data_dir_override: Some(PathBuf::from("/tmp/pika")),
             init_config: Some(BackendInitConfig {
                 sync_request_timeout_ms: Some(10_000),
                 default_open_room_limit: Some(40),
@@ -730,10 +1039,23 @@ mod tests {
     }
 
     #[test]
-    fn startup_sequence_is_ordered() {
-        let sequence = startup_command_sequence(&sample_config());
+    fn startup_restore_sequence_is_ordered() {
+        let intent = AuthSessionIntent {
+            homeserver: "https://matrix.example.org".to_owned(),
+            user_id: "@alice:example.org".to_owned(),
+            remember_password: true,
+            data_dir: PathBuf::from("/tmp/pika"),
+        };
+        let sequence = startup_restore_command_sequence(&sample_config(), &intent);
         assert_eq!(sequence.len(), 2);
-        assert!(matches!(sequence[0], BackendCommand::Init { .. }));
+        assert!(matches!(
+            &sequence[0],
+            BackendCommand::Init {
+                homeserver,
+                data_dir,
+                ..
+            } if homeserver == "https://matrix.example.org" && data_dir == &PathBuf::from("/tmp/pika")
+        ));
         assert!(matches!(sequence[1], BackendCommand::RestoreSession));
     }
 
@@ -745,13 +1067,29 @@ mod tests {
     }
 
     #[test]
-    fn login_password_command_uses_config_credentials() {
-        let command = login_password_command(&sample_config());
+    fn login_command_sequence_uses_intent_and_remember_policy() {
+        let config = sample_config();
+        let intent = AuthSessionIntent {
+            homeserver: "https://matrix.example.org".to_owned(),
+            user_id: "@alice:example.org".to_owned(),
+            remember_password: false,
+            data_dir: PathBuf::from("/tmp/pika"),
+        };
+        let sequence = login_command_sequence(&config, &intent, "secret".to_owned());
         assert!(matches!(
-            command,
+            &sequence[0],
+            BackendCommand::Init {
+                homeserver,
+                data_dir,
+                ..
+            } if homeserver == "https://matrix.example.org" && data_dir == &PathBuf::from("/tmp/pika")
+        ));
+        assert!(matches!(
+            &sequence[1],
             BackendCommand::LoginPassword {
                 user_id_or_localpart,
                 password,
+                persist_session: false,
             } if user_id_or_localpart == "@alice:example.org" && password == "secret"
         ));
     }
@@ -836,5 +1174,42 @@ mod tests {
                 recovery_key,
             } if client_txn_id == "txn-restore" && recovery_key == "key words"
         ));
+    }
+
+    #[test]
+    fn normalize_homeserver_accepts_host_and_upgrades_http() {
+        assert_eq!(
+            normalize_homeserver("matrix.example.org".to_owned()).expect("host should normalize"),
+            "https://matrix.example.org"
+        );
+        assert_eq!(
+            normalize_homeserver("http://matrix.example.org".to_owned())
+                .expect("http should be upgraded"),
+            "https://matrix.example.org"
+        );
+        assert_eq!(
+            normalize_homeserver("https://matrix.example.org/".to_owned())
+                .expect("https should normalize"),
+            "https://matrix.example.org"
+        );
+    }
+
+    #[test]
+    fn normalize_homeserver_rejects_non_https_scheme() {
+        let err = normalize_homeserver("ftp://matrix.example.org".to_owned())
+            .expect_err("non-https scheme must be rejected");
+        assert!(err.contains("https"));
+    }
+
+    #[test]
+    fn display_homeserver_host_strips_scheme_for_ui() {
+        assert_eq!(
+            display_homeserver_host("https://matrix.example.org"),
+            "matrix.example.org"
+        );
+        assert_eq!(
+            display_homeserver_host("http://matrix.example.org:8448/"),
+            "matrix.example.org:8448"
+        );
     }
 }

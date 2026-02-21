@@ -59,6 +59,13 @@ pub struct DesktopSnapshot {
     pub status_text: String,
     pub error_text: Option<String>,
     pub can_send: bool,
+    pub show_login_screen: bool,
+    pub login_homeserver: String,
+    pub login_user_id: String,
+    pub login_password: String,
+    pub login_remember_password: bool,
+    pub login_in_flight: bool,
+    pub show_logout_confirm: bool,
     pub show_security_dialog: bool,
     pub security_dialog_title: String,
     pub security_dialog_body: String,
@@ -124,6 +131,13 @@ pub struct DesktopState {
     pending_invite_actions: HashMap<String, InviteAction>,
     pending_invite_actions_by_txn: HashMap<String, String>,
     pagination: PaginationTracker,
+    show_login_screen: bool,
+    login_homeserver: String,
+    login_user_id: String,
+    login_password: String,
+    login_remember_password: bool,
+    login_in_flight: bool,
+    show_logout_confirm: bool,
     show_security_dialog: bool,
     security_dialog_title: String,
     security_dialog_body: String,
@@ -152,6 +166,13 @@ impl DesktopState {
             pending_invite_actions: HashMap::new(),
             pending_invite_actions_by_txn: HashMap::new(),
             pagination: PaginationTracker::default(),
+            show_login_screen: false,
+            login_homeserver: String::new(),
+            login_user_id: String::new(),
+            login_password: String::new(),
+            login_remember_password: false,
+            login_in_flight: false,
+            show_logout_confirm: false,
             show_security_dialog: false,
             security_dialog_title: String::new(),
             security_dialog_body: String::new(),
@@ -183,6 +204,13 @@ impl DesktopState {
             status_text: self.status_text.clone(),
             error_text: self.error_text.clone(),
             can_send: self.can_send_message(),
+            show_login_screen: self.show_login_screen,
+            login_homeserver: self.login_homeserver.clone(),
+            login_user_id: self.login_user_id.clone(),
+            login_password: self.login_password.clone(),
+            login_remember_password: self.login_remember_password,
+            login_in_flight: self.login_in_flight,
+            show_logout_confirm: self.show_logout_confirm,
             show_security_dialog: self.show_security_dialog,
             security_dialog_title: self.security_dialog_title.clone(),
             security_dialog_body: self.security_dialog_body.clone(),
@@ -202,6 +230,64 @@ impl DesktopState {
     /// Clears the top-level error message.
     pub fn clear_error(&mut self) {
         self.error_text = None;
+    }
+
+    /// Set login-form values shown by the UI.
+    pub fn set_login_form(
+        &mut self,
+        homeserver: impl Into<String>,
+        user_id: impl Into<String>,
+        password: impl Into<String>,
+        remember_password: bool,
+    ) {
+        self.login_homeserver = homeserver.into();
+        self.login_user_id = user_id.into();
+        self.login_password = password.into();
+        self.login_remember_password = remember_password;
+    }
+
+    /// Show login pane and clear in-flight login state.
+    pub fn show_login_screen(&mut self) {
+        self.show_login_screen = true;
+        self.login_in_flight = false;
+        self.show_logout_confirm = false;
+    }
+
+    /// Hide login pane after successful authentication.
+    pub fn hide_login_screen(&mut self) {
+        self.show_login_screen = false;
+        self.login_in_flight = false;
+        self.show_logout_confirm = false;
+    }
+
+    /// Mark restore-session flow as in-flight.
+    pub fn begin_restore_attempt(&mut self) {
+        self.show_login_screen = false;
+        self.login_in_flight = true;
+        self.show_logout_confirm = false;
+        self.status_text = "Restoring session...".to_owned();
+    }
+
+    /// Mark manual login as in-flight and update login form values.
+    pub fn begin_manual_login(
+        &mut self,
+        homeserver: impl Into<String>,
+        user_id: impl Into<String>,
+        password: impl Into<String>,
+        remember_password: bool,
+    ) {
+        let user_id = user_id.into();
+        self.own_user_id = user_id.clone();
+        self.set_login_form(homeserver, user_id, password, remember_password);
+        self.show_login_screen = true;
+        self.login_in_flight = true;
+        self.show_logout_confirm = false;
+        self.status_text = "Authenticating...".to_owned();
+    }
+
+    /// Show/hide logout confirmation dialog.
+    pub fn set_logout_confirm_visible(&mut self, visible: bool) {
+        self.show_logout_confirm = visible;
     }
 
     /// Show a modal-style security dialog in the UI.
@@ -480,6 +566,10 @@ impl DesktopState {
         match event {
             BackendEvent::StateChanged { state } => {
                 self.status_text = lifecycle_label(state).to_owned();
+                if state == BackendLifecycleState::LoggedOut {
+                    self.clear_authenticated_data();
+                    self.show_login_screen();
+                }
             }
             BackendEvent::AuthResult {
                 success,
@@ -487,12 +577,15 @@ impl DesktopState {
             } => {
                 if success {
                     self.status_text = "Authenticated".to_owned();
+                    self.hide_login_screen();
                     self.clear_error();
                 } else {
                     let code = error_code.unwrap_or_else(|| "unknown".to_owned());
                     self.status_text = "Authentication failed".to_owned();
                     self.error_text = Some(auth_error_text(&code));
+                    self.show_login_screen();
                 }
+                self.login_in_flight = false;
             }
             BackendEvent::SyncStatus(SyncStatus {
                 running,
@@ -596,6 +689,7 @@ impl DesktopState {
             }
             BackendEvent::FatalError { code, message, .. } => {
                 self.pagination.clear_in_flight();
+                self.login_in_flight = false;
                 warn!(%code, %message, "backend fatal error surfaced to state");
                 self.status_text = "Backend error".to_owned();
                 self.error_text = Some(format!("{code}: {message}"));
@@ -628,6 +722,18 @@ impl DesktopState {
         } else {
             None
         }
+    }
+
+    fn clear_authenticated_data(&mut self) {
+        self.rooms.clear();
+        self.selected_room_id = None;
+        self.timelines.clear();
+        self.messages.clear();
+        self.pending_sends.clear();
+        self.pending_invite_actions.clear();
+        self.pending_invite_actions_by_txn.clear();
+        self.pagination.clear_in_flight();
+        self.dismiss_security_dialog();
     }
 
     fn rebuild_visible_messages(&mut self) {

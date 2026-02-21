@@ -67,6 +67,7 @@ async fn run() -> Result<(), String> {
                 BackendCommand::LoginPassword {
                     user_id_or_localpart: user.clone(),
                     password,
+                    persist_session: true,
                 },
                 "LoginPassword",
             )

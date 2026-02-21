@@ -30,7 +30,7 @@ PikaChat is aiming to be the Matrix client you open before a match, not after on
 PikaChat is now in an early but functional desktop MVP phase:
 
 - Rust Matrix backend runtime is live and integrated into the desktop app.
-- Desktop app can authenticate from environment variables, list joined rooms, open a room, render timeline bubbles, and send plain-text messages.
+- Desktop app now has a login pane, remember-session restore, logout with destructive local wipe, room list/timeline rendering, and plain-text message send.
 - Timeline updates live from sync events.
 - Sidebar is resizable and room selection is wired to backend room open/pagination commands.
 - Security menu supports:
@@ -82,7 +82,13 @@ cargo test --workspace
 
 ### Run the Desktop App
 
-For live usage, provide Matrix credentials via env vars:
+Run the desktop app:
+
+```bash
+cargo run -p pikachat-desktop
+```
+
+Optional env prefill (does not auto-login):
 
 ```bash
 PIKACHAT_HOMESERVER='https://matrix.example.org' \
@@ -93,10 +99,13 @@ cargo run -p pikachat-desktop
 
 Expected behavior:
 
-- Window opens and attempts session restore/login.
+- Window opens to the login pane unless a remembered session is restored.
+- Login homeserver input is host-only (`matrix.example.org`); app enforces secure `https://`.
 - Joined rooms appear in the left sidebar.
 - Selecting a room loads timeline items in chat bubbles.
 - Sending a message posts it to the selected room.
+- `Remember password` controls whether session restore is persisted across relaunches.
+- `File -> Logout` asks for confirmation, then clears local chat/cache/keys and returns to login.
 - `File -> Quit` exits cleanly.
 - `Help -> About Slint...` opens the About view containing Slint's built-in `AboutSlint` widget.
 - `Security` menu exposes backup/reset/restore flows.
@@ -136,11 +145,11 @@ Current priorities after this MVP slice:
 - improve encrypted-history recovery UX (clearer guidance and key lifecycle handling),
 - continue timeline decryption quality for older encrypted events,
 - add media send/download UI,
-- add proper login/session management UI (instead of env-only startup),
+- refine login/session management UX and account-switch ergonomics,
 - keep backend APIs UI-agnostic for future mobile/client reuse.
 
 ## Security Notes
 
 - `PLAN.md` is local-only planning scratch and is intentionally not committed.
-- Credentials should be passed via environment variables for live testing.
+- Environment credentials are optional prefill only; no password is persisted by the desktop app.
 - Do not commit secrets.

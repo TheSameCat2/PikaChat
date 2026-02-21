@@ -81,6 +81,8 @@ pub enum BackendCommand {
         user_id_or_localpart: String,
         /// Password for the user account.
         password: String,
+        /// Whether the authenticated session should be persisted for restore.
+        persist_session: bool,
     },
     /// Attempt session restore from persisted session data.
     RestoreSession,
