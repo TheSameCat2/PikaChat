@@ -45,6 +45,14 @@ impl TimelineBuffer {
                         .ok_or_else(|| TimelineMergeError::MissingEvent(event_id.clone()))?;
                     item.body = new_body.clone();
                 }
+                TimelineOp::Replace { event_id, item } => {
+                    let existing = self
+                        .items
+                        .iter_mut()
+                        .find(|it| it.event_id.as_deref() == Some(event_id.as_str()))
+                        .ok_or_else(|| TimelineMergeError::MissingEvent(event_id.clone()))?;
+                    *existing = item.clone();
+                }
                 TimelineOp::Remove { event_id } => {
                     let idx = self
                         .items
@@ -83,12 +91,14 @@ impl TimelineBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::TimelineContent;
 
     fn item(event_id: &str, body: &str) -> TimelineItem {
         TimelineItem {
             event_id: Some(event_id.to_owned()),
             sender: "@alice:example.org".to_owned(),
             body: body.to_owned(),
+            content: TimelineContent::Text,
             timestamp_ms: 1_731_000_000,
         }
     }
@@ -124,6 +134,44 @@ mod tests {
                 new_body: "x".into(),
             }])
             .expect_err("should reject updates to unknown events");
+        assert_eq!(err, TimelineMergeError::MissingEvent("$404".into()));
+    }
+
+    #[test]
+    fn replaces_existing_item() {
+        let mut timeline = TimelineBuffer::new(10);
+        timeline
+            .apply_ops(&[
+                TimelineOp::Append(item("$1", "old")),
+                TimelineOp::Replace {
+                    event_id: "$1".into(),
+                    item: TimelineItem {
+                        event_id: Some("$1".into()),
+                        sender: "@bob:example.org".into(),
+                        body: "new".into(),
+                        content: TimelineContent::Text,
+                        timestamp_ms: 1_732_000_000,
+                    },
+                },
+            ])
+            .expect("replace should work");
+
+        assert_eq!(timeline.items().len(), 1);
+        assert_eq!(timeline.items()[0].event_id.as_deref(), Some("$1"));
+        assert_eq!(timeline.items()[0].sender, "@bob:example.org");
+        assert_eq!(timeline.items()[0].body, "new");
+        assert_eq!(timeline.items()[0].timestamp_ms, 1_732_000_000);
+    }
+
+    #[test]
+    fn fails_when_event_for_replace_is_missing() {
+        let mut timeline = TimelineBuffer::new(10);
+        let err = timeline
+            .apply_ops(&[TimelineOp::Replace {
+                event_id: "$404".into(),
+                item: item("$1", "x"),
+            }])
+            .expect_err("should reject replacements to unknown events");
         assert_eq!(err, TimelineMergeError::MissingEvent("$404".into()));
     }
 

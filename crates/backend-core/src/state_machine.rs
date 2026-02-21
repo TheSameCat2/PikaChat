@@ -74,6 +74,7 @@ impl BackendStateMachine {
             | PaginateBack { .. }
             | SendDmText { .. }
             | SendMessage { .. }
+            | SendMediaMessage { .. }
             | EditMessage { .. }
             | RedactMessage { .. }
             | UploadMedia { .. }

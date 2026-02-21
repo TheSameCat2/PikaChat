@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::{collections::BTreeMap, fmt};
 
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +49,109 @@ pub enum InviteAction {
     Accept,
     /// Reject a pending room invite.
     Reject,
+}
+
+/// Reference to downloadable/uploaded media content.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MediaSourceRef {
+    /// Plain Matrix content URI (`mxc://...`).
+    PlainMxc { uri: String },
+    /// Encrypted Matrix file descriptor (`m.file`-style content).
+    EncryptedFile(EncryptedFileSource),
+}
+
+impl From<String> for MediaSourceRef {
+    fn from(value: String) -> Self {
+        Self::PlainMxc { uri: value }
+    }
+}
+
+impl From<&str> for MediaSourceRef {
+    fn from(value: &str) -> Self {
+        Self::PlainMxc {
+            uri: value.to_owned(),
+        }
+    }
+}
+
+impl fmt::Display for MediaSourceRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PlainMxc { uri } => f.write_str(uri),
+            Self::EncryptedFile(file) => f.write_str(&file.url),
+        }
+    }
+}
+
+/// Encrypted Matrix file descriptor (`m.file`) used to fetch/decrypt media.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EncryptedFileSource {
+    /// Encrypted content location (`mxc://...`).
+    pub url: String,
+    /// Serialized JWK payload used to decrypt content.
+    pub key: String,
+    /// Base64-encoded initialization vector.
+    pub iv: String,
+    /// Hash map keyed by algorithm name (for example `sha256`).
+    pub hashes: BTreeMap<String, String>,
+    /// Encryption version identifier (for example `v2`).
+    pub v: String,
+}
+
+/// Optional display metadata for rendered images.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct TimelineImageMetadata {
+    /// MIME content type when known.
+    pub content_type: Option<String>,
+    /// Pixel width when known.
+    pub width: Option<u32>,
+    /// Pixel height when known.
+    pub height: Option<u32>,
+    /// Decoded byte size when known.
+    pub size_bytes: Option<u64>,
+}
+
+/// Timeline image payload containing media source and optional metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TimelineImageContent {
+    /// Media source reference for download/rendering.
+    pub source: MediaSourceRef,
+    /// Optional image metadata for layout and UX hints.
+    pub metadata: Option<TimelineImageMetadata>,
+}
+
+/// Canonical timeline content variants for frontend rendering.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TimelineContent {
+    /// A text timeline event.
+    Text,
+    /// An image timeline event.
+    Image(TimelineImageContent),
+    /// Placeholder for encrypted content that cannot be rendered yet.
+    EncryptedPlaceholder,
+}
+
+impl Default for TimelineContent {
+    fn default() -> Self {
+        Self::Text
+    }
+}
+
+/// Outgoing media payload for send commands.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OutgoingMedia {
+    /// Send an image event.
+    Image {
+        /// Human-readable body/caption.
+        body: String,
+        /// Uploaded or encrypted media reference.
+        source: MediaSourceRef,
+        /// Optional image metadata.
+        metadata: Option<TimelineImageMetadata>,
+    },
 }
 
 /// Optional runtime tuning values supplied with `BackendCommand::Init`.
@@ -138,6 +242,15 @@ pub enum BackendCommand {
         /// Message kind (`m.text`/`m.notice`/`m.emote`).
         msgtype: MessageType,
     },
+    /// Send a media room message.
+    SendMediaMessage {
+        /// Target room ID.
+        room_id: String,
+        /// Frontend-provided transaction ID echoed in `SendAck`.
+        client_txn_id: String,
+        /// Media payload to send.
+        media: OutgoingMedia,
+    },
     /// Edit an existing room message.
     EditMessage {
         /// Target room ID.
@@ -171,8 +284,8 @@ pub enum BackendCommand {
     DownloadMedia {
         /// Frontend-provided transaction ID echoed in `MediaDownloadAck`.
         client_txn_id: String,
-        /// `mxc://` URI source.
-        source: String,
+        /// Media source reference.
+        source: MediaSourceRef,
     },
     /// Fetch latest local/server key-backup and recovery status summary.
     GetRecoveryStatus,
@@ -241,6 +354,9 @@ pub struct TimelineItem {
     pub sender: String,
     /// Display-ready text body.
     pub body: String,
+    /// Canonical content kind and media payload.
+    #[serde(default)]
+    pub content: TimelineContent,
     /// Event timestamp in milliseconds since Unix epoch.
     pub timestamp_ms: u64,
 }
@@ -254,6 +370,11 @@ pub enum TimelineOp {
     Prepend(TimelineItem),
     /// Update body of an existing event.
     UpdateBody { event_id: String, new_body: String },
+    /// Replace an existing event with a fully-populated item.
+    Replace {
+        event_id: String,
+        item: TimelineItem,
+    },
     /// Remove an existing event.
     Remove { event_id: String },
     /// Clear all timeline items.
@@ -296,8 +417,8 @@ pub struct MediaUploadAck {
 pub struct MediaDownloadAck {
     /// Original frontend transaction ID.
     pub client_txn_id: String,
-    /// Requested source URI.
-    pub source: String,
+    /// Requested media source reference.
+    pub source: MediaSourceRef,
     /// Downloaded bytes on success.
     pub data: Option<Vec<u8>>,
     /// Optional MIME content type when known.
@@ -431,7 +552,7 @@ pub enum BackendEvent {
         /// Snapshot items in display order.
         items: Vec<TimelineItem>,
     },
-    /// Send acknowledgement (`SendMessage`, `SendDmText`, `EditMessage`).
+    /// Send acknowledgement (`SendMessage`, `SendMediaMessage`, `SendDmText`, `EditMessage`).
     SendAck(SendAck),
     /// Media upload acknowledgement.
     MediaUploadAck(MediaUploadAck),

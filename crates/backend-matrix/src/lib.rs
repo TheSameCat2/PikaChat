@@ -17,7 +17,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use backend_core::types::{InviteAction, InviteActionAck, RoomMembership};
+use backend_core::types::{
+    InviteAction, InviteActionAck, MediaSourceRef, OutgoingMedia, RoomMembership, TimelineContent,
+    TimelineImageContent, TimelineImageMetadata,
+};
 use backend_core::{
     BackendChannelError, BackendChannels, BackendCommand, BackendError, BackendErrorCategory,
     BackendEvent, BackendInitConfig, BackendLifecycleState, BackendStateMachine, EventStream,
@@ -48,8 +51,11 @@ use matrix_sdk::{
             uiaa::UserIdentifier,
         },
         events::room::{
-            MediaSource,
-            message::{RoomMessageEventContent, RoomMessageEventContentWithoutRelation},
+            ImageInfo, MediaSource,
+            message::{
+                ImageMessageEventContent, MessageType as RoomMessageType, RoomMessageEventContent,
+                RoomMessageEventContentWithoutRelation,
+            },
         },
     },
     store::RoomLoadSettings,
@@ -77,6 +83,7 @@ const REL_TYPE_REPLACE: &str = "m.replace";
 const MSGTYPE_TEXT: &str = "m.text";
 const MSGTYPE_NOTICE: &str = "m.notice";
 const MSGTYPE_EMOTE: &str = "m.emote";
+const MSGTYPE_IMAGE: &str = "m.image";
 const ENCRYPTED_TIMELINE_PLACEHOLDER: &str = "[Encrypted message: keys unavailable on this device]";
 const TO_DEVICE_ROOM_KEY_EVENT_TYPE: &str = "m.room_key";
 const TO_DEVICE_FORWARDED_ROOM_KEY_EVENT_TYPE: &str = "m.forwarded_room_key";
@@ -243,7 +250,10 @@ impl MatrixBackend {
 
             let retry_policy = RetryPolicy::default();
             let mut attempt: u32 = 0;
-            let mut room_event_bodies: HashMap<String, HashMap<String, String>> = HashMap::new();
+            let mut room_event_signatures: HashMap<
+                String,
+                HashMap<String, TimelineEventSignature>,
+            > = HashMap::new();
             let mut sync_settings = match sync_request_timeout {
                 Some(timeout) => SyncSettings::default().timeout(timeout),
                 None => SyncSettings::default(),
@@ -256,8 +266,10 @@ impl MatrixBackend {
                         match sync_result {
                             Ok(sync_response) => {
                                 attempt = 0;
-                                let deltas =
-                                    sync_timeline_deltas(&sync_response, &mut room_event_bodies);
+                                let deltas = sync_timeline_deltas(
+                                    &sync_response,
+                                    &mut room_event_signatures,
+                                );
                                 trace!(room_delta_count = deltas.len(), "sync response processed");
                                 for (room_id, ops) in deltas {
                                     debug!(
@@ -277,7 +289,7 @@ impl MatrixBackend {
                                 if sync_response_has_room_key_events(&sync_response) {
                                     let refresh_deltas = refresh_room_timeline_updates_after_room_keys(
                                         &client,
-                                        &mut room_event_bodies,
+                                        &mut room_event_signatures,
                                     )
                                     .await;
                                     for (room_id, ops) in refresh_deltas {
@@ -394,6 +406,53 @@ impl MatrixBackend {
             MessageType::Text => RoomMessageEventContent::text_plain(body),
             MessageType::Notice => RoomMessageEventContent::notice_plain(body),
             MessageType::Emote => RoomMessageEventContent::emote_plain(body),
+        };
+
+        let response = room.send(content).await.map_err(map_matrix_error)?;
+        Ok(response.event_id.to_string())
+    }
+
+    /// Send a media room message and return created event ID.
+    pub async fn send_media_message(
+        &self,
+        room_id: &str,
+        media: &OutgoingMedia,
+    ) -> Result<String, BackendError> {
+        let room = self.lookup_room(room_id)?;
+
+        let content = match media {
+            OutgoingMedia::Image {
+                body,
+                source,
+                metadata,
+            } => {
+                let uri = match source {
+                    MediaSourceRef::PlainMxc { uri } => parse_mxc_uri(uri)?,
+                    MediaSourceRef::EncryptedFile(_) => {
+                        return Err(BackendError::new(
+                            BackendErrorCategory::Config,
+                            "unsupported_media_source",
+                            "sending encrypted media descriptors is not supported; upload media first and send PlainMxc",
+                        ));
+                    }
+                };
+                let mut image = ImageMessageEventContent::plain(body.clone(), uri);
+                if let Some(metadata) = metadata {
+                    let mut info = ImageInfo::new();
+                    info.mimetype = metadata.content_type.clone();
+                    info.width = metadata.width.and_then(|width| UInt::new(width.into()));
+                    info.height = metadata.height.and_then(|height| UInt::new(height.into()));
+                    info.size = metadata.size_bytes.and_then(UInt::new);
+                    if info.mimetype.is_some()
+                        || info.width.is_some()
+                        || info.height.is_some()
+                        || info.size.is_some()
+                    {
+                        image = image.info(Some(Box::new(info)));
+                    }
+                }
+                RoomMessageEventContent::new(RoomMessageType::Image(image))
+            }
         };
 
         let response = room.send(content).await.map_err(map_matrix_error)?;
@@ -523,15 +582,15 @@ impl MatrixBackend {
     }
 
     /// Download media bytes from an `mxc://` source.
-    pub async fn download_media(&self, source: &str) -> Result<Vec<u8>, BackendError> {
-        let source = parse_mxc_uri(source)?;
+    pub async fn download_media(&self, source: &MediaSourceRef) -> Result<Vec<u8>, BackendError> {
+        let source = media_source_ref_to_matrix_source(source)?;
         let request = MediaRequestParameters {
-            source: MediaSource::Plain(source),
+            source,
             format: MediaFormat::File,
         };
         self.client
             .media()
-            .get_media_content(&request, true)
+            .get_media_content(&request, false)
             .await
             .map_err(map_matrix_error)
     }
@@ -672,6 +731,11 @@ trait RuntimeBackend: Send + Sync {
         body: &str,
         msgtype: MessageType,
     ) -> Result<String, BackendError>;
+    async fn send_media_message(
+        &self,
+        room_id: &str,
+        media: &OutgoingMedia,
+    ) -> Result<String, BackendError>;
     async fn edit_message(
         &self,
         room_id: &str,
@@ -700,7 +764,7 @@ trait RuntimeBackend: Send + Sync {
     async fn reject_room_invite(&self, room_id: &str) -> Result<(), BackendError>;
     async fn upload_media(&self, content_type: &str, data: Vec<u8>)
     -> Result<String, BackendError>;
-    async fn download_media(&self, source: &str) -> Result<Vec<u8>, BackendError>;
+    async fn download_media(&self, source: &MediaSourceRef) -> Result<Vec<u8>, BackendError>;
     async fn get_recovery_status(&self) -> Result<RecoveryStatus, BackendError>;
     async fn enable_recovery(
         &self,
@@ -771,6 +835,14 @@ impl RuntimeBackend for MatrixBackend {
         MatrixBackend::send_message(self, room_id, body, msgtype).await
     }
 
+    async fn send_media_message(
+        &self,
+        room_id: &str,
+        media: &OutgoingMedia,
+    ) -> Result<String, BackendError> {
+        MatrixBackend::send_media_message(self, room_id, media).await
+    }
+
     async fn edit_message(
         &self,
         room_id: &str,
@@ -826,7 +898,7 @@ impl RuntimeBackend for MatrixBackend {
         MatrixBackend::upload_media(self, content_type, data).await
     }
 
-    async fn download_media(&self, source: &str) -> Result<Vec<u8>, BackendError> {
+    async fn download_media(&self, source: &MediaSourceRef) -> Result<Vec<u8>, BackendError> {
         MatrixBackend::download_media(self, source).await
     }
 
@@ -1292,6 +1364,15 @@ impl MatrixRuntime {
                 msgtype,
             } => {
                 self.handle_send_message(room_id, client_txn_id, body, msgtype)
+                    .await;
+                Ok(())
+            }
+            BackendCommand::SendMediaMessage {
+                room_id,
+                client_txn_id,
+                media,
+            } => {
+                self.handle_send_media_message(room_id, client_txn_id, media)
                     .await;
                 Ok(())
             }
@@ -2034,6 +2115,55 @@ impl MatrixRuntime {
             .emit(normalize_send_outcome(client_txn_id, outcome));
     }
 
+    async fn handle_send_media_message(
+        &mut self,
+        room_id: String,
+        client_txn_id: String,
+        media: OutgoingMedia,
+    ) {
+        debug!(
+            room_id = %room_id,
+            client_txn_id = %client_txn_id,
+            "handling SendMediaMessage command"
+        );
+        let validation = self.validate_transition(BackendCommand::SendMediaMessage {
+            room_id: String::new(),
+            client_txn_id: String::new(),
+            media: OutgoingMedia::Image {
+                body: String::new(),
+                source: MediaSourceRef::PlainMxc { uri: String::new() },
+                metadata: None,
+            },
+        });
+
+        if let Err(err) = validation {
+            self.channels.emit(normalize_send_outcome(
+                client_txn_id,
+                SendOutcome::Failure { error: err },
+            ));
+            return;
+        }
+
+        let backend = match self.require_backend() {
+            Ok(backend) => backend,
+            Err(err) => {
+                self.channels.emit(normalize_send_outcome(
+                    client_txn_id,
+                    SendOutcome::Failure { error: err },
+                ));
+                return;
+            }
+        };
+
+        let outcome = match backend.send_media_message(&room_id, &media).await {
+            Ok(event_id) => SendOutcome::Success { event_id },
+            Err(error) => SendOutcome::Failure { error },
+        };
+
+        self.channels
+            .emit(normalize_send_outcome(client_txn_id, outcome));
+    }
+
     async fn handle_edit_message(
         &mut self,
         room_id: String,
@@ -2195,7 +2325,7 @@ impl MatrixRuntime {
         }
     }
 
-    async fn handle_download_media(&mut self, client_txn_id: String, source: String) {
+    async fn handle_download_media(&mut self, client_txn_id: String, source: MediaSourceRef) {
         debug!(
             client_txn_id = %client_txn_id,
             source = %source,
@@ -2203,7 +2333,7 @@ impl MatrixRuntime {
         );
         let validation = self.validate_transition(BackendCommand::DownloadMedia {
             client_txn_id: String::new(),
-            source: String::new(),
+            source: MediaSourceRef::PlainMxc { uri: String::new() },
         });
 
         if let Err(err) = validation {
@@ -2748,6 +2878,7 @@ fn command_kind(command: &BackendCommand) -> &'static str {
         BackendCommand::PaginateBack { .. } => "PaginateBack",
         BackendCommand::SendDmText { .. } => "SendDmText",
         BackendCommand::SendMessage { .. } => "SendMessage",
+        BackendCommand::SendMediaMessage { .. } => "SendMediaMessage",
         BackendCommand::EditMessage { .. } => "EditMessage",
         BackendCommand::RedactMessage { .. } => "RedactMessage",
         BackendCommand::UploadMedia { .. } => "UploadMedia",
@@ -2821,6 +2952,36 @@ fn parse_mxc_uri(value: &str) -> Result<OwnedMxcUri, BackendError> {
         )
     })?;
     Ok(uri)
+}
+
+fn media_source_ref_to_matrix_source(source: &MediaSourceRef) -> Result<MediaSource, BackendError> {
+    match source {
+        MediaSourceRef::PlainMxc { uri } => Ok(MediaSource::Plain(parse_mxc_uri(uri)?)),
+        MediaSourceRef::EncryptedFile(file) => {
+            let key = serde_json::from_str::<serde_json::Value>(&file.key).map_err(|err| {
+                BackendError::new(
+                    BackendErrorCategory::Serialization,
+                    "invalid_media_source",
+                    format!("invalid encrypted media key descriptor: {err}"),
+                )
+            })?;
+            let descriptor = serde_json::json!({
+                "url": file.url,
+                "key": key,
+                "iv": file.iv,
+                "hashes": file.hashes,
+                "v": file.v
+            });
+            let encrypted = serde_json::from_value(descriptor).map_err(|err| {
+                BackendError::new(
+                    BackendErrorCategory::Serialization,
+                    "invalid_media_source",
+                    format!("invalid encrypted media descriptor: {err}"),
+                )
+            })?;
+            Ok(MediaSource::Encrypted(Box::new(encrypted)))
+        }
+    }
 }
 
 fn parse_media_content_type(value: &str) -> Result<mime::Mime, BackendError> {
@@ -3042,39 +3203,74 @@ fn timeline_ops_for_pagination(messages: Messages) -> Vec<TimelineOp> {
 fn timeline_ops_for_sync_events(
     events: &[TimelineEvent],
     limited: bool,
-    known_event_bodies: &mut HashMap<String, String>,
+    known_event_signatures: &mut HashMap<String, TimelineEventSignature>,
 ) -> Vec<TimelineOp> {
     let mut ops = Vec::new();
     if limited {
         ops.push(TimelineOp::Clear);
-        known_event_bodies.clear();
+        known_event_signatures.clear();
     }
     for event in events {
         if let Some(op) = timeline_op_from_event(event, TimelineInsertMode::Append) {
             match op {
                 TimelineOp::Append(item) => {
                     if let Some(event_id) = item.event_id.as_ref() {
-                        if let Some(existing_body) = known_event_bodies.get(event_id) {
-                            if existing_body == &item.body {
+                        if let Some(existing_signature) =
+                            known_event_signatures.get(event_id).cloned()
+                        {
+                            let candidate_signature = timeline_event_signature(&item);
+                            if existing_signature == candidate_signature {
                                 continue;
                             }
-                            known_event_bodies.insert(event_id.clone(), item.body.clone());
-                            ops.push(TimelineOp::UpdateBody {
-                                event_id: event_id.clone(),
-                                new_body: item.body,
-                            });
+                            known_event_signatures
+                                .insert(event_id.clone(), candidate_signature.clone());
+                            if existing_signature.content_fingerprint
+                                == candidate_signature.content_fingerprint
+                            {
+                                ops.push(TimelineOp::UpdateBody {
+                                    event_id: event_id.clone(),
+                                    new_body: item.body,
+                                });
+                            } else {
+                                ops.push(TimelineOp::Replace {
+                                    event_id: event_id.clone(),
+                                    item,
+                                });
+                            }
                             continue;
                         }
-                        known_event_bodies.insert(event_id.clone(), item.body.clone());
+                        known_event_signatures
+                            .insert(event_id.clone(), timeline_event_signature(&item));
                     }
                     ops.push(TimelineOp::Append(item));
                 }
                 TimelineOp::UpdateBody { event_id, new_body } => {
-                    known_event_bodies.insert(event_id.clone(), new_body.clone());
+                    match known_event_signatures.get_mut(&event_id) {
+                        Some(existing) => {
+                            existing.full_fingerprint =
+                                timeline_full_fingerprint(&existing.content_fingerprint, &new_body);
+                            existing.body = new_body.clone();
+                        }
+                        None => {
+                            let content_fingerprint =
+                                timeline_content_fingerprint(&TimelineContent::Text, None);
+                            known_event_signatures.insert(
+                                event_id.clone(),
+                                TimelineEventSignature {
+                                    body: new_body.clone(),
+                                    content_fingerprint: content_fingerprint.clone(),
+                                    full_fingerprint: timeline_full_fingerprint(
+                                        &content_fingerprint,
+                                        &new_body,
+                                    ),
+                                },
+                            );
+                        }
+                    }
                     ops.push(TimelineOp::UpdateBody { event_id, new_body });
                 }
                 TimelineOp::Remove { event_id } => {
-                    known_event_bodies.remove(&event_id);
+                    known_event_signatures.remove(&event_id);
                     ops.push(TimelineOp::Remove { event_id });
                 }
                 other => ops.push(other),
@@ -3154,17 +3350,17 @@ fn event_type(event: &TimelineEvent) -> Option<String> {
 
 fn sync_timeline_deltas(
     sync_response: &matrix_sdk::sync::SyncResponse,
-    room_event_bodies: &mut HashMap<String, HashMap<String, String>>,
+    room_event_signatures: &mut HashMap<String, HashMap<String, TimelineEventSignature>>,
 ) -> Vec<(String, Vec<TimelineOp>)> {
     let mut deltas = Vec::new();
 
     for (room_id, update) in &sync_response.rooms.joined {
         let room_id = room_id.to_string();
-        let known_event_bodies = room_event_bodies.entry(room_id.clone()).or_default();
+        let known_event_signatures = room_event_signatures.entry(room_id.clone()).or_default();
         let ops = timeline_ops_for_sync_events(
             &update.timeline.events,
             update.timeline.limited,
-            known_event_bodies,
+            known_event_signatures,
         );
         if !ops.is_empty() {
             deltas.push((room_id, ops));
@@ -3190,11 +3386,11 @@ fn sync_response_has_room_key_events(sync_response: &matrix_sdk::sync::SyncRespo
 
 async fn refresh_room_timeline_updates_after_room_keys(
     client: &Client,
-    room_event_bodies: &mut HashMap<String, HashMap<String, String>>,
+    room_event_signatures: &mut HashMap<String, HashMap<String, TimelineEventSignature>>,
 ) -> Vec<(String, Vec<TimelineOp>)> {
-    let candidate_room_ids: Vec<String> = room_event_bodies
+    let candidate_room_ids: Vec<String> = room_event_signatures
         .iter()
-        .filter(|(_, known_event_bodies)| !known_event_bodies.is_empty())
+        .filter(|(_, known_event_signatures)| !known_event_signatures.is_empty())
         .map(|(room_id, _)| room_id.clone())
         .take(ROOM_KEY_REFRESH_ROOM_LIMIT)
         .collect();
@@ -3235,10 +3431,10 @@ async fn refresh_room_timeline_updates_after_room_keys(
             }
         };
 
-        let Some(known_event_bodies) = room_event_bodies.get_mut(&room_id) else {
+        let Some(known_event_signatures) = room_event_signatures.get_mut(&room_id) else {
             continue;
         };
-        let ops = timeline_update_ops_for_refresh_events(&messages.chunk, known_event_bodies);
+        let ops = timeline_update_ops_for_refresh_events(&messages.chunk, known_event_signatures);
         if !ops.is_empty() {
             deltas.push((room_id, ops));
         }
@@ -3249,7 +3445,7 @@ async fn refresh_room_timeline_updates_after_room_keys(
 
 fn timeline_update_ops_for_refresh_events(
     events: &[TimelineEvent],
-    known_event_bodies: &mut HashMap<String, String>,
+    known_event_signatures: &mut HashMap<String, TimelineEventSignature>,
 ) -> Vec<TimelineOp> {
     let mut ops = Vec::new();
 
@@ -3260,37 +3456,49 @@ fn timeline_update_ops_for_refresh_events(
 
         match op {
             TimelineOp::Append(item) => {
-                let Some(event_id) = item.event_id else {
+                let Some(event_id) = item.event_id.as_ref() else {
                     continue;
                 };
-                let Some(existing_body) = known_event_bodies.get(&event_id) else {
+                let Some(existing_signature) = known_event_signatures.get(event_id).cloned() else {
                     continue;
                 };
-                if existing_body == &item.body {
+                let candidate_signature = timeline_event_signature(&item);
+                if existing_signature == candidate_signature {
                     continue;
                 }
-                known_event_bodies.insert(event_id.clone(), item.body.clone());
-                ops.push(TimelineOp::UpdateBody {
-                    event_id,
-                    new_body: item.body,
-                });
+                known_event_signatures.insert(event_id.clone(), candidate_signature.clone());
+                if existing_signature.content_fingerprint == candidate_signature.content_fingerprint
+                {
+                    ops.push(TimelineOp::UpdateBody {
+                        event_id: event_id.clone(),
+                        new_body: item.body,
+                    });
+                } else {
+                    ops.push(TimelineOp::Replace {
+                        event_id: event_id.clone(),
+                        item,
+                    });
+                }
             }
             TimelineOp::UpdateBody { event_id, new_body } => {
-                let Some(existing_body) = known_event_bodies.get(&event_id) else {
+                let Some(existing_signature) = known_event_signatures.get_mut(&event_id) else {
                     continue;
                 };
-                if existing_body == &new_body {
+                let candidate_fingerprint =
+                    timeline_full_fingerprint(&existing_signature.content_fingerprint, &new_body);
+                if existing_signature.full_fingerprint == candidate_fingerprint {
                     continue;
                 }
-                known_event_bodies.insert(event_id.clone(), new_body.clone());
+                existing_signature.body = new_body.clone();
+                existing_signature.full_fingerprint = candidate_fingerprint;
                 ops.push(TimelineOp::UpdateBody { event_id, new_body });
             }
             TimelineOp::Remove { event_id } => {
-                if known_event_bodies.remove(&event_id).is_some() {
+                if known_event_signatures.remove(&event_id).is_some() {
                     ops.push(TimelineOp::Remove { event_id });
                 }
             }
-            TimelineOp::Prepend(_) | TimelineOp::Clear => {}
+            TimelineOp::Prepend(_) | TimelineOp::Clear | TimelineOp::Replace { .. } => {}
         }
     }
 
@@ -3314,6 +3522,7 @@ fn timeline_item_from_event(
             event_id: event.event_id().map(|event_id| event_id.to_string()),
             sender,
             body: ENCRYPTED_TIMELINE_PLACEHOLDER.to_owned(),
+            content: TimelineContent::EncryptedPlaceholder,
             timestamp_ms,
         });
     }
@@ -3336,13 +3545,171 @@ fn timeline_item_from_event(
         return None;
     }
 
-    let body = extract_basic_message_body(&content)?;
+    let msgtype = content
+        .get("msgtype")
+        .and_then(|value| value.as_str())
+        .unwrap_or(MSGTYPE_TEXT);
+
+    let (body, content) = match msgtype {
+        MSGTYPE_TEXT | MSGTYPE_NOTICE | MSGTYPE_EMOTE => (
+            content
+                .get("body")
+                .and_then(|value| value.as_str())?
+                .to_owned(),
+            TimelineContent::Text,
+        ),
+        MSGTYPE_IMAGE => {
+            let source = extract_media_source_ref_from_content(&content)?;
+            let metadata = extract_image_metadata_from_content(&content);
+            let filename = content
+                .get("filename")
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned);
+            let body = content
+                .get("body")
+                .and_then(|value| value.as_str())
+                .map(ToOwned::to_owned)
+                .or(filename)
+                .unwrap_or_else(|| source.to_string());
+            (
+                body,
+                TimelineContent::Image(TimelineImageContent { source, metadata }),
+            )
+        }
+        _ => return None,
+    };
+
     Some(TimelineItem {
         event_id: event.event_id().map(|event_id| event_id.to_string()),
         sender,
         body,
+        content,
         timestamp_ms,
     })
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TimelineEventSignature {
+    body: String,
+    content_fingerprint: String,
+    full_fingerprint: String,
+}
+
+fn timeline_event_signature(item: &TimelineItem) -> TimelineEventSignature {
+    let filename = match &item.content {
+        TimelineContent::Image(_) => extract_image_filename_hint(&item.body),
+        _ => None,
+    };
+    let content_fingerprint = timeline_content_fingerprint(&item.content, filename.as_deref());
+    TimelineEventSignature {
+        body: item.body.clone(),
+        full_fingerprint: timeline_full_fingerprint(&content_fingerprint, &item.body),
+        content_fingerprint,
+    }
+}
+
+fn timeline_full_fingerprint(content_fingerprint: &str, body: &str) -> String {
+    format!("{content_fingerprint}\nbody={body}")
+}
+
+fn timeline_content_fingerprint(content: &TimelineContent, filename: Option<&str>) -> String {
+    match content {
+        TimelineContent::Text => "kind=text".to_owned(),
+        TimelineContent::EncryptedPlaceholder => "kind=encrypted_placeholder".to_owned(),
+        TimelineContent::Image(image) => {
+            let source = match &image.source {
+                MediaSourceRef::PlainMxc { uri } => format!("plain:{uri}"),
+                MediaSourceRef::EncryptedFile(file) => {
+                    let mut hashes = String::new();
+                    for (algorithm, value) in &file.hashes {
+                        hashes.push_str(algorithm);
+                        hashes.push('=');
+                        hashes.push_str(value);
+                        hashes.push(';');
+                    }
+                    format!(
+                        "encrypted:url={}|iv={}|v={}|key={}|hashes={}",
+                        file.url, file.iv, file.v, file.key, hashes
+                    )
+                }
+            };
+            let metadata = image
+                .metadata
+                .as_ref()
+                .map(|metadata| {
+                    format!(
+                        "type={:?};w={:?};h={:?};size={:?}",
+                        metadata.content_type, metadata.width, metadata.height, metadata.size_bytes
+                    )
+                })
+                .unwrap_or_else(|| "none".to_owned());
+            format!(
+                "kind=image\nsource={source}\nmetadata={metadata}\nfilename={:?}",
+                filename
+            )
+        }
+    }
+}
+
+fn extract_media_source_ref_from_content(content: &serde_json::Value) -> Option<MediaSourceRef> {
+    if let Some(file) = content.get("file") {
+        let url = file.get("url").and_then(|value| value.as_str())?;
+        let key = file.get("key")?;
+        let iv = file.get("iv").and_then(|value| value.as_str())?;
+        let v = file.get("v").and_then(|value| value.as_str())?;
+        let hashes: std::collections::BTreeMap<String, String> =
+            serde_json::from_value(file.get("hashes")?.clone()).ok()?;
+        return Some(MediaSourceRef::EncryptedFile(
+            backend_core::types::EncryptedFileSource {
+                url: url.to_owned(),
+                key: key.to_string(),
+                iv: iv.to_owned(),
+                hashes,
+                v: v.to_owned(),
+            },
+        ));
+    }
+
+    content
+        .get("url")
+        .and_then(|value| value.as_str())
+        .map(|uri| MediaSourceRef::PlainMxc {
+            uri: uri.to_owned(),
+        })
+}
+
+fn extract_image_metadata_from_content(
+    content: &serde_json::Value,
+) -> Option<TimelineImageMetadata> {
+    let info = content.get("info")?;
+    let content_type = info
+        .get("mimetype")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+    let width = info
+        .get("w")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok());
+    let height = info
+        .get("h")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok());
+    let size_bytes = info.get("size").and_then(|value| value.as_u64());
+
+    if content_type.is_none() && width.is_none() && height.is_none() && size_bytes.is_none() {
+        None
+    } else {
+        Some(TimelineImageMetadata {
+            content_type,
+            width,
+            height,
+            size_bytes,
+        })
+    }
+}
+
+fn extract_image_filename_hint(body: &str) -> Option<&str> {
+    if body.is_empty() { None } else { Some(body) }
 }
 
 fn extract_basic_message_body(content: &serde_json::Value) -> Option<String> {
@@ -3601,15 +3968,28 @@ mod tests {
         body: &str,
         origin_server_ts: u64,
     ) -> TimelineEvent {
+        let mut content = serde_json::json!({
+            "msgtype": msgtype,
+            "body": body
+        });
+        if msgtype == MSGTYPE_IMAGE {
+            content["url"] = serde_json::Value::String(format!(
+                "mxc://example.org/{}",
+                event_id.trim_start_matches('$')
+            ));
+            content["info"] = serde_json::json!({
+                "mimetype": "image/png",
+                "w": 640,
+                "h": 360,
+                "size": 12345
+            });
+        }
         let json = serde_json::json!({
             "type": "m.room.message",
             "event_id": event_id,
             "sender": sender,
             "origin_server_ts": origin_server_ts,
-            "content": {
-                "msgtype": msgtype,
-                "body": body
-            }
+            "content": content
         });
 
         let raw = Raw::<AnySyncTimelineEvent>::from_json_string(json.to_string())
@@ -3716,6 +4096,7 @@ mod tests {
             event_id: Some(event_id.to_owned()),
             sender: "@alice:example.org".to_owned(),
             body: body.to_owned(),
+            content: TimelineContent::Text,
             timestamp_ms: 1,
         }
     }
@@ -4026,6 +4407,15 @@ mod tests {
             self.send_message_result.clone()
         }
 
+        async fn send_media_message(
+            &self,
+            _room_id: &str,
+            _media: &OutgoingMedia,
+        ) -> Result<String, BackendError> {
+            self.record_call("send_media_message");
+            self.send_message_result.clone()
+        }
+
         async fn edit_message(
             &self,
             _room_id: &str,
@@ -4097,7 +4487,7 @@ mod tests {
             self.upload_media_result.clone()
         }
 
-        async fn download_media(&self, _source: &str) -> Result<Vec<u8>, BackendError> {
+        async fn download_media(&self, _source: &MediaSourceRef) -> Result<Vec<u8>, BackendError> {
             self.record_call("download_media");
             self.download_media_result.clone()
         }
@@ -4299,7 +4689,7 @@ mod tests {
     }
 
     #[test]
-    fn sync_timeline_ops_ignore_non_text_message_types() {
+    fn sync_timeline_ops_maps_image_messages() {
         let image = make_sync_timeline_event_with_msgtype(
             "$img1:example.org",
             "@alice:example.org",
@@ -4317,8 +4707,15 @@ mod tests {
 
         let mut known_event_bodies = HashMap::new();
         let ops = timeline_ops_for_sync_events(&[image, notice], false, &mut known_event_bodies);
-        assert_eq!(ops.len(), 1);
+        assert_eq!(ops.len(), 2);
         match &ops[0] {
+            TimelineOp::Append(item) => {
+                assert_eq!(item.event_id.as_deref(), Some("$img1:example.org"));
+                assert!(matches!(item.content, TimelineContent::Image(_)));
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
+        match &ops[1] {
             TimelineOp::Append(item) => {
                 assert_eq!(item.event_id.as_deref(), Some("$notice1:example.org"));
                 assert_eq!(item.body, "Server maintenance in 10 minutes.");
@@ -4359,9 +4756,10 @@ mod tests {
         let second_ops = timeline_ops_for_sync_events(&[decrypted], false, &mut known_event_bodies);
         assert_eq!(second_ops.len(), 1);
         match &second_ops[0] {
-            TimelineOp::UpdateBody { event_id, new_body } => {
+            TimelineOp::Replace { event_id, item } => {
                 assert_eq!(event_id, "$enc2:example.org");
-                assert_eq!(new_body, "decrypted body");
+                assert_eq!(item.body, "decrypted body");
+                assert!(matches!(item.content, TimelineContent::Text));
             }
             other => panic!("unexpected op: {other:?}"),
         }
@@ -4386,9 +4784,18 @@ mod tests {
 
     #[test]
     fn refresh_updates_only_known_event_bodies() {
+        let encrypted_content_fingerprint =
+            timeline_content_fingerprint(&TimelineContent::EncryptedPlaceholder, None);
         let mut known_event_bodies = HashMap::from([(
             "$enc3:example.org".to_owned(),
-            ENCRYPTED_TIMELINE_PLACEHOLDER.to_owned(),
+            TimelineEventSignature {
+                body: ENCRYPTED_TIMELINE_PLACEHOLDER.to_owned(),
+                full_fingerprint: timeline_full_fingerprint(
+                    &encrypted_content_fingerprint,
+                    ENCRYPTED_TIMELINE_PLACEHOLDER,
+                ),
+                content_fingerprint: encrypted_content_fingerprint,
+            },
         )]);
         let unknown = make_sync_timeline_event("$new:example.org", "@alice:example.org", "new", 1);
         let decrypted_known =
@@ -4400,16 +4807,17 @@ mod tests {
         );
         assert_eq!(ops.len(), 1);
         match &ops[0] {
-            TimelineOp::UpdateBody { event_id, new_body } => {
+            TimelineOp::Replace { event_id, item } => {
                 assert_eq!(event_id, "$enc3:example.org");
-                assert_eq!(new_body, "decrypted");
+                assert_eq!(item.body, "decrypted");
+                assert!(matches!(item.content, TimelineContent::Text));
             }
             other => panic!("unexpected op: {other:?}"),
         }
         assert_eq!(
             known_event_bodies
                 .get("$enc3:example.org")
-                .map(String::as_str),
+                .map(|signature| signature.body.as_str()),
             Some("decrypted")
         );
         assert!(!known_event_bodies.contains_key("$new:example.org"));
@@ -4417,8 +4825,15 @@ mod tests {
 
     #[test]
     fn refresh_emits_remove_when_known_event_is_redacted() {
-        let mut known_event_bodies =
-            HashMap::from([("$target:example.org".to_owned(), "hello".to_owned())]);
+        let text_fingerprint = timeline_content_fingerprint(&TimelineContent::Text, None);
+        let mut known_event_bodies = HashMap::from([(
+            "$target:example.org".to_owned(),
+            TimelineEventSignature {
+                body: "hello".to_owned(),
+                full_fingerprint: timeline_full_fingerprint(&text_fingerprint, "hello"),
+                content_fingerprint: text_fingerprint,
+            },
+        )]);
         let redaction = make_sync_redaction_event(
             "$redact:example.org",
             "@alice:example.org",
@@ -4995,7 +5410,9 @@ mod tests {
         handle
             .send(BackendCommand::DownloadMedia {
                 client_txn_id: "tx-download-1".to_owned(),
-                source: "mxc://example.org/file".to_owned(),
+                source: MediaSourceRef::PlainMxc {
+                    uri: "mxc://example.org/file".to_owned(),
+                },
             })
             .await
             .expect("command should enqueue");
@@ -5008,7 +5425,7 @@ mod tests {
         match event {
             BackendEvent::MediaDownloadAck(ack) => {
                 assert_eq!(ack.client_txn_id, "tx-download-1");
-                assert_eq!(ack.source, "mxc://example.org/file");
+                assert_eq!(ack.source, "mxc://example.org/file".into());
                 assert_eq!(ack.data, None);
                 assert_eq!(ack.error_code.as_deref(), Some("invalid_state_transition"));
             }
@@ -5089,7 +5506,9 @@ mod tests {
         handle
             .send(BackendCommand::DownloadMedia {
                 client_txn_id: "tx-download-ok".to_owned(),
-                source: "mxc://example.org/uploaded".to_owned(),
+                source: MediaSourceRef::PlainMxc {
+                    uri: "mxc://example.org/uploaded".to_owned(),
+                },
             })
             .await
             .expect("download should enqueue");
@@ -5102,7 +5521,8 @@ mod tests {
                     data: Some(_),
                     error_code: None,
                     ..
-                }) if client_txn_id == "tx-download-ok" && source == "mxc://example.org/uploaded"
+                }) if client_txn_id == "tx-download-ok"
+                    && matches!(source, MediaSourceRef::PlainMxc { uri } if uri == "mxc://example.org/uploaded")
             )
         })
         .await;
@@ -5231,7 +5651,9 @@ mod tests {
         handle
             .send(BackendCommand::DownloadMedia {
                 client_txn_id: "tx-download-fail".to_owned(),
-                source: "mxc://example.org/uploaded".to_owned(),
+                source: MediaSourceRef::PlainMxc {
+                    uri: "mxc://example.org/uploaded".to_owned(),
+                },
             })
             .await
             .expect("download should enqueue");
