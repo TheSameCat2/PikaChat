@@ -1,4 +1,4 @@
-import { AboutSlint, Button, CheckBox, ListView, TextEdit } from "std-widgets.slint";
+import { AboutSlint, Button, CheckBox, LineEdit, ListView, TextEdit } from "std-widgets.slint";
 
 export struct RoomRow {
     room_id: string,
@@ -520,12 +520,13 @@ export component MainWindow inherits Window {
                 color: #c4d0ea;
                 font-size: 12px;
             }
-            password-input := TextEdit {
+            password-input := LineEdit {
                 x: 20px;
                 y: 248px;
                 width: parent.width - 40px;
                 height: 36px;
                 text <=> root.login-password;
+                input-type: InputType.password;
                 enabled: !root.login-in-flight;
 
                 key-pressed(event) => {
