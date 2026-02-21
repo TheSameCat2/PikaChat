@@ -171,13 +171,9 @@ impl DesktopState {
         let selected_room_is_invite = selected_room
             .map(|room| room.membership == RoomMembership::Invited)
             .unwrap_or(false);
-        let selected_room_invite_pending_text = selected_room.and_then(|room| {
-            if room.invite_pending {
-                Some(room.invite_pending_text.clone())
-            } else {
-                None
-            }
-        });
+        let selected_room_invite_pending_text = selected_room
+            .filter(|room| room.invite_pending)
+            .map(|room| room.invite_pending_text.clone());
         DesktopSnapshot {
             rooms: self.rooms.clone(),
             messages: self.messages.clone(),
