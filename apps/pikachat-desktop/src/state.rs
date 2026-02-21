@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use backend_core::types::{InviteAction, InviteActionAck, RoomMembership};
 use backend_core::{
     BackendEvent, BackendLifecycleState, KeyBackupState, RecoveryState, RecoveryStatus,
-    RoomSummary, SendAck, SyncStatus, TimelineItem, TimelineOp,
+    MediaSourceRef, RoomSummary, SendAck, SyncStatus, TimelineContent, TimelineItem, TimelineOp,
 };
 use tracing::{debug, trace, warn};
 
@@ -16,6 +16,7 @@ const SECURITY_TITLE_STATUS: &str = "Identity Backup Status";
 const SECURITY_TITLE_CREATING: &str = "Creating Identity Backup";
 const SECURITY_TITLE_CREATED: &str = "Identity Backup Created";
 const SECURITY_TITLE_RESTORE: &str = "Identity Restore";
+const MAX_PENDING_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SecurityDialogMode {
@@ -43,9 +44,23 @@ pub struct RoomView {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageView {
     pub event_id: Option<String>,
+    pub local_id: Option<String>,
     pub sender: String,
     pub body: String,
+    pub event_kind: String,
+    pub caption: String,
+    pub media_status: String,
+    pub media_source: Option<String>,
+    pub media_cached_path: Option<String>,
+    pub can_retry: bool,
+    pub can_remove: bool,
     pub is_own: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerAttachmentView {
+    pub file_name: String,
+    pub local_path: String,
 }
 
 /// Full UI snapshot emitted after state transitions.
@@ -74,6 +89,74 @@ pub struct DesktopSnapshot {
     pub security_show_restore_input: bool,
     pub security_restore_button_text: String,
     pub security_restore_in_flight: bool,
+    pub composer_attachment: Option<ComposerAttachmentView>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaStatus {
+    Missing,
+    Downloading,
+    Ready,
+    Failed,
+}
+
+impl MediaStatus {
+    fn as_ui_label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Downloading => "downloading",
+            Self::Ready => "ready",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingOutgoingMediaStatus {
+    Uploading,
+    Sending,
+    UploadFailed,
+    SendFailed,
+}
+
+impl PendingOutgoingMediaStatus {
+    fn as_ui_label(self) -> &'static str {
+        match self {
+            Self::Uploading => "uploading",
+            Self::Sending => "sending",
+            Self::UploadFailed => "upload_failed",
+            Self::SendFailed => "send_failed",
+        }
+    }
+
+    fn can_retry(self) -> bool {
+        matches!(self, Self::UploadFailed | Self::SendFailed)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MediaState {
+    status: MediaStatus,
+    cached_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingAttachment {
+    pub file_name: String,
+    pub local_path: String,
+    pub content_type: String,
+    pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingOutgoingMedia {
+    pub room_id: String,
+    pub local_id: String,
+    pub sender: String,
+    pub caption: String,
+    pub local_path: String,
+    pub media_source: Option<String>,
+    pub status: PendingOutgoingMediaStatus,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -130,6 +213,9 @@ pub struct DesktopState {
     pending_sends: HashSet<String>,
     pending_invite_actions: HashMap<String, InviteAction>,
     pending_invite_actions_by_txn: HashMap<String, String>,
+    media: HashMap<String, MediaState>,
+    pending_attachment: Option<PendingAttachment>,
+    pending_outgoing_media: HashMap<String, PendingOutgoingMedia>,
     pagination: PaginationTracker,
     show_login_screen: bool,
     login_homeserver: String,
@@ -165,6 +251,9 @@ impl DesktopState {
             pending_sends: HashSet::new(),
             pending_invite_actions: HashMap::new(),
             pending_invite_actions_by_txn: HashMap::new(),
+            media: HashMap::new(),
+            pending_attachment: None,
+            pending_outgoing_media: HashMap::new(),
             pagination: PaginationTracker::default(),
             show_login_screen: false,
             login_homeserver: String::new(),
@@ -219,6 +308,12 @@ impl DesktopState {
             security_show_restore_input: self.security_show_restore_input,
             security_restore_button_text: self.security_restore_button_text.clone(),
             security_restore_in_flight: self.security_restore_in_flight,
+            composer_attachment: self.pending_attachment.as_ref().map(|attachment| {
+                ComposerAttachmentView {
+                    file_name: attachment.file_name.clone(),
+                    local_path: attachment.local_path.clone(),
+                }
+            }),
         }
     }
 
@@ -421,6 +516,44 @@ impl DesktopState {
         self.pending_invite_actions.contains_key(room_id)
     }
 
+    pub fn set_pending_attachment(&mut self, attachment: PendingAttachment) {
+        self.pending_attachment = Some(attachment);
+    }
+
+    pub fn clear_pending_attachment(&mut self) {
+        self.pending_attachment = None;
+    }
+
+    pub fn take_pending_attachment(&mut self) -> Option<PendingAttachment> {
+        self.pending_attachment.take()
+    }
+
+    pub fn validate_attachment(
+        local_path: String,
+        file_name: String,
+        content_type: String,
+        size_bytes: u64,
+    ) -> Result<PendingAttachment, String> {
+        if size_bytes > MAX_PENDING_ATTACHMENT_BYTES {
+            return Err("attachment is too large (max 20MB)".to_owned());
+        }
+        let ext = file_name
+            .rsplit('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let is_allowed = matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif");
+        if !is_allowed {
+            return Err("unsupported attachment type (allowed: jpg, png, gif)".to_owned());
+        }
+        Ok(PendingAttachment {
+            file_name,
+            local_path,
+            content_type,
+            size_bytes,
+        })
+    }
+
     /// Update room list while preserving backend ordering.
     pub fn replace_rooms(&mut self, rooms: Vec<RoomSummary>) {
         let selected = self.selected_room_id.clone();
@@ -524,7 +657,10 @@ impl DesktopState {
 
     /// Handle send acknowledgement from backend.
     pub fn handle_send_ack(&mut self, ack: SendAck) {
-        self.pending_sends.remove(&ack.client_txn_id);
+        let was_pending = self.pending_sends.remove(&ack.client_txn_id);
+        if !was_pending {
+            return;
+        }
         if let Some(error_code) = ack.error_code {
             warn!(
                 client_txn_id = %ack.client_txn_id,
@@ -561,6 +697,120 @@ impl DesktopState {
         }
     }
 
+    pub fn selected_room_uncached_image_sources(&self) -> Vec<MediaSourceRef> {
+        let Some(room_id) = &self.selected_room_id else {
+            return Vec::new();
+        };
+        let Some(items) = self.timelines.get(room_id) else {
+            return Vec::new();
+        };
+
+        let mut unique = HashSet::new();
+        items
+            .iter()
+            .filter_map(image_source_of_item)
+            .filter(|source| !self.media.contains_key(&media_source_key(source)))
+            .filter(|source| unique.insert(media_source_key(source)))
+            .collect()
+    }
+
+    pub fn media_source_ref_for_key(&self, source_key: &str) -> Option<MediaSourceRef> {
+        self.timelines.values().flat_map(|items| items.iter()).find_map(|item| {
+            let source = image_source_of_item(item)?;
+            if media_source_key(&source) == source_key {
+                Some(source)
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn mark_media_download_started(&mut self, source: String) {
+        self.media
+            .entry(source)
+            .and_modify(|state| state.status = MediaStatus::Downloading)
+            .or_insert(MediaState {
+                status: MediaStatus::Downloading,
+                cached_path: None,
+            });
+        self.rebuild_visible_messages();
+    }
+
+    pub fn mark_media_download_ready(&mut self, source: String, cached_path: String) {
+        self.media.insert(
+            source,
+            MediaState {
+                status: MediaStatus::Ready,
+                cached_path: Some(cached_path),
+            },
+        );
+        self.rebuild_visible_messages();
+    }
+
+    pub fn mark_media_download_failed(&mut self, source: String) {
+        self.media
+            .entry(source)
+            .and_modify(|state| state.status = MediaStatus::Failed)
+            .or_insert(MediaState {
+                status: MediaStatus::Failed,
+                cached_path: None,
+            });
+        self.rebuild_visible_messages();
+    }
+
+    pub fn upsert_pending_outgoing_media(
+        &mut self,
+        local_id: String,
+        room_id: String,
+        caption: String,
+        local_path: String,
+        status: PendingOutgoingMediaStatus,
+    ) {
+        self.pending_outgoing_media.insert(
+            local_id.clone(),
+            PendingOutgoingMedia {
+                room_id,
+                local_id,
+                sender: self.own_user_id.clone(),
+                caption,
+                local_path,
+                media_source: None,
+                status,
+            },
+        );
+        self.rebuild_visible_messages();
+    }
+
+    pub fn pending_outgoing_media(&self, local_id: &str) -> Option<PendingOutgoingMedia> {
+        self.pending_outgoing_media.get(local_id).cloned()
+    }
+
+    pub fn set_pending_outgoing_upload_failed(&mut self, local_id: &str) {
+        if let Some(item) = self.pending_outgoing_media.get_mut(local_id) {
+            item.status = PendingOutgoingMediaStatus::UploadFailed;
+            self.rebuild_visible_messages();
+        }
+    }
+
+    pub fn set_pending_outgoing_sending(&mut self, local_id: &str, source: String) {
+        if let Some(item) = self.pending_outgoing_media.get_mut(local_id) {
+            item.status = PendingOutgoingMediaStatus::Sending;
+            item.media_source = Some(source);
+            self.rebuild_visible_messages();
+        }
+    }
+
+    pub fn set_pending_outgoing_send_failed(&mut self, local_id: &str) {
+        if let Some(item) = self.pending_outgoing_media.get_mut(local_id) {
+            item.status = PendingOutgoingMediaStatus::SendFailed;
+            self.rebuild_visible_messages();
+        }
+    }
+
+    pub fn remove_pending_outgoing_media(&mut self, local_id: &str) {
+        self.pending_outgoing_media.remove(local_id);
+        self.rebuild_visible_messages();
+    }
     /// Feed one backend event into the reducer.
     pub fn handle_backend_event(&mut self, event: BackendEvent) {
         match event {
@@ -742,21 +992,82 @@ impl DesktopState {
             return;
         };
 
-        self.messages = self
+        let mut messages = self
             .timelines
             .get(room_id)
             .map(|items| {
                 items
                     .iter()
-                    .map(|item| MessageView {
-                        event_id: item.event_id.clone(),
-                        sender: item.sender.clone(),
-                        body: item.body.clone(),
-                        is_own: item.sender == self.own_user_id,
+                    .map(|item| {
+                        let source = image_source_of_item(item);
+                        if let Some(source_ref) = source {
+                            let source = media_source_key(&source_ref);
+                            let media = self.media.get(&source);
+                            let media_status = media
+                                .map(|state| state.status)
+                                .unwrap_or(MediaStatus::Missing)
+                                .as_ui_label()
+                                .to_owned();
+                            MessageView {
+                                event_id: item.event_id.clone(),
+                                local_id: None,
+                                sender: item.sender.clone(),
+                                body: item.body.clone(),
+                                event_kind: "image".to_owned(),
+                                caption: item.body.clone(),
+                                media_status,
+                                media_source: Some(source),
+                                media_cached_path: media
+                                    .and_then(|state| state.cached_path.clone()),
+                                can_retry: media.map(|state| state.status)
+                                    == Some(MediaStatus::Failed),
+                                can_remove: false,
+                                is_own: item.sender == self.own_user_id,
+                            }
+                        } else {
+                            MessageView {
+                                event_id: item.event_id.clone(),
+                                local_id: None,
+                                sender: item.sender.clone(),
+                                body: item.body.clone(),
+                                event_kind: "text".to_owned(),
+                                caption: String::new(),
+                                media_status: "none".to_owned(),
+                                media_source: None,
+                                media_cached_path: None,
+                                can_retry: false,
+                                can_remove: false,
+                                is_own: item.sender == self.own_user_id,
+                            }
+                        }
                     })
-                    .collect()
+                    .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+
+        let mut pending = self
+            .pending_outgoing_media
+            .values()
+            .filter(|item| &item.room_id == room_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        pending.sort_by(|a, b| a.local_id.cmp(&b.local_id));
+
+        messages.extend(pending.into_iter().map(|item| MessageView {
+            event_id: None,
+            local_id: Some(item.local_id),
+            sender: item.sender,
+            body: item.caption.clone(),
+            event_kind: "image".to_owned(),
+            caption: item.caption,
+            media_status: item.status.as_ui_label().to_owned(),
+            media_source: item.media_source,
+            media_cached_path: Some(item.local_path),
+            can_retry: item.status.can_retry(),
+            can_remove: true,
+            is_own: true,
+        }));
+        self.messages = messages;
     }
 }
 
@@ -851,6 +1162,14 @@ fn apply_delta_lenient(items: &mut Vec<TimelineItem>, ops: &[TimelineOp]) {
                     items.remove(index);
                 }
             }
+            TimelineOp::Replace { event_id, item } => {
+                if let Some(existing) = items
+                    .iter_mut()
+                    .find(|it| it.event_id.as_deref() == Some(event_id.as_str()))
+                {
+                    *existing = item.clone();
+                }
+            }
             TimelineOp::Clear => items.clear(),
         }
     }
@@ -878,6 +1197,17 @@ fn dedupe_and_trim(items: Vec<TimelineItem>, max_items: usize) -> Vec<TimelineIt
     reversed
 }
 
+fn image_source_of_item(item: &TimelineItem) -> Option<MediaSourceRef> {
+    match &item.content {
+        TimelineContent::Image(image) => Some(image.source.clone()),
+        _ => None,
+    }
+}
+
+fn media_source_key(source: &MediaSourceRef) -> String {
+    source.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -887,6 +1217,7 @@ mod tests {
             event_id: Some(event_id.to_owned()),
             sender: sender.to_owned(),
             body: body.to_owned(),
+            content: TimelineContent::Text,
             timestamp_ms: 1_700_000_000,
         }
     }

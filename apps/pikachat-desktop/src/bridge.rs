@@ -2,7 +2,7 @@
 
 use std::{
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -11,9 +11,13 @@ use std::{
 };
 
 use arboard::Clipboard;
+use backend_core::{
+    BackendCommand, BackendEvent, BackendLifecycleState, MediaDownloadAck, MediaSourceRef,
+    MediaUploadAck, MessageType, OutgoingMedia, SendAck,
+};
 use backend_core::types::InviteAction;
-use backend_core::{BackendCommand, BackendEvent, BackendLifecycleState, MessageType};
 use backend_matrix::MatrixFrontendAdapter;
+use rfd::FileDialog;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{debug, error, info, trace, warn};
 use url::Url;
@@ -21,7 +25,8 @@ use url::Url;
 use crate::{
     auth_profile::{AuthProfile, clear_auth_profile, load_auth_profile, save_auth_profile},
     config::DesktopConfig,
-    state::{DesktopSnapshot, DesktopState},
+    media_cache::MediaCache,
+    state::{DesktopSnapshot, DesktopState, PendingOutgoingMediaStatus},
 };
 
 /// Callback used to publish new UI snapshots.
@@ -42,6 +47,12 @@ pub struct DesktopBridge {
     clipboard: Mutex<Option<Clipboard>>,
     ui_update: UiUpdateCallback,
     next_txn_id: AtomicU64,
+    media_cache: Arc<Mutex<MediaCache>>,
+    media_downloads_in_flight: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    media_download_txn_to_source: Arc<Mutex<std::collections::HashMap<String, String>>>,
+    media_uploads_in_flight:
+        Arc<Mutex<std::collections::HashMap<String, PendingOutgoingUploadContext>>>,
+    media_send_txn_to_local_id: Arc<Mutex<std::collections::HashMap<String, String>>>,
     paginate_limit: u16,
     pagination_top_threshold_px: f32,
     pagination_cooldown_ms: u64,
@@ -49,6 +60,30 @@ pub struct DesktopBridge {
     pending_auth_intent: Arc<Mutex<Option<AuthSessionIntent>>>,
     command_task: tokio::task::JoinHandle<()>,
     event_task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingOutgoingUploadContext {
+    room_id: String,
+    local_id: String,
+    caption: String,
+    local_path: String,
+    content_type: String,
+}
+
+enum SendPlan {
+    Text {
+        room_id: String,
+        client_txn_id: String,
+        body: String,
+    },
+    Attachment {
+        room_id: String,
+        local_id: String,
+        caption: String,
+        local_path: String,
+        content_type: String,
+    },
 }
 
 impl DesktopBridge {
@@ -64,7 +99,6 @@ impl DesktopBridge {
             paginate_limit = config.paginate_limit,
             "spawning desktop bridge"
         );
-
         let login_profile_path = config.auth_profile_path();
         let saved_profile = match load_auth_profile(&login_profile_path) {
             Ok(profile) => profile,
@@ -131,6 +165,17 @@ impl DesktopBridge {
         }
         let state = Arc::new(Mutex::new(initial_state));
         let pending_auth_intent = Arc::new(Mutex::new(startup_restore_intent.clone()));
+        let media_cache_root = login_profile_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let media_cache = Arc::new(Mutex::new(
+            create_media_cache(&media_cache_root).expect("failed to initialize media cache"),
+        ));
+        let media_downloads_in_flight = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let media_download_txn_to_source = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let media_uploads_in_flight = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let media_send_txn_to_local_id = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
         let (command_tx, mut command_rx) = mpsc::unbounded_channel::<BackendCommand>();
         let adapter_for_command_task = Arc::clone(&adapter);
@@ -147,6 +192,11 @@ impl DesktopBridge {
         });
 
         let state_for_events = Arc::clone(&state);
+        let media_cache_for_events = Arc::clone(&media_cache);
+        let media_downloads_in_flight_for_events = Arc::clone(&media_downloads_in_flight);
+        let media_download_txn_to_source_for_events = Arc::clone(&media_download_txn_to_source);
+        let media_uploads_in_flight_for_events = Arc::clone(&media_uploads_in_flight);
+        let media_send_txn_to_local_id_for_events = Arc::clone(&media_send_txn_to_local_id);
         let ui_update_for_events = Arc::clone(&ui_update);
         let command_tx_for_events = command_tx.clone();
         let pending_auth_intent_for_events = Arc::clone(&pending_auth_intent);
@@ -231,6 +281,35 @@ impl DesktopBridge {
                     _ => None,
                 };
 
+                match &event {
+                    BackendEvent::MediaDownloadAck(ack) => {
+                        handle_media_download_ack(
+                            &state_for_events,
+                            &media_cache_for_events,
+                            &media_downloads_in_flight_for_events,
+                            &media_download_txn_to_source_for_events,
+                            ack,
+                        );
+                    }
+                    BackendEvent::MediaUploadAck(ack) => {
+                        handle_media_upload_ack(
+                            &command_tx_for_events,
+                            &state_for_events,
+                            &media_uploads_in_flight_for_events,
+                            &media_send_txn_to_local_id_for_events,
+                            ack,
+                        );
+                    }
+                    BackendEvent::SendAck(ack) => {
+                        handle_media_send_ack(
+                            &state_for_events,
+                            &media_send_txn_to_local_id_for_events,
+                            ack,
+                        );
+                    }
+                    _ => {}
+                }
+
                 let snapshot = {
                     let mut state = state_for_events
                         .lock()
@@ -252,6 +331,14 @@ impl DesktopBridge {
                         error!("failed to enqueue OpenRoom after invite accept");
                     }
                 }
+
+                trigger_lazy_media_downloads(
+                    &state_for_events,
+                    &command_tx_for_events,
+                    &media_cache_for_events,
+                    &media_downloads_in_flight_for_events,
+                    &media_download_txn_to_source_for_events,
+                );
             }
             warn!("desktop event worker exiting: backend event stream closed");
         });
@@ -262,6 +349,11 @@ impl DesktopBridge {
             clipboard: Mutex::new(None),
             ui_update,
             next_txn_id: AtomicU64::new(1),
+            media_cache,
+            media_downloads_in_flight,
+            media_download_txn_to_source,
+            media_uploads_in_flight,
+            media_send_txn_to_local_id,
             paginate_limit: config.paginate_limit.max(1),
             pagination_top_threshold_px: config.pagination_top_threshold_px,
             pagination_cooldown_ms: config.pagination_cooldown_ms,
@@ -438,12 +530,8 @@ impl DesktopBridge {
     /// Returns `true` when a send command was queued.
     pub fn send_message(&self, body: String) -> bool {
         let body = body.trim().to_owned();
-        if body.is_empty() {
-            debug!("ignoring empty send request");
-            return false;
-        }
 
-        let (room_id, client_txn_id) = {
+        let send_plan = {
             let mut state = self
                 .state
                 .lock()
@@ -463,26 +551,297 @@ impl DesktopBridge {
                 return false;
             }
 
-            let client_txn_id = format!(
-                "desktop-send-{}",
-                self.next_txn_id.fetch_add(1, Ordering::Relaxed)
-            );
-            state.mark_send_requested(client_txn_id.clone());
-            state.clear_error();
-            let snapshot = state.snapshot();
-            (self.ui_update)(snapshot);
+            if let Some(attachment) = state.take_pending_attachment() {
+                let local_id = format!(
+                    "desktop-media-local-{}",
+                    self.next_txn_id.fetch_add(1, Ordering::Relaxed)
+                );
+                let caption = if body.is_empty() {
+                    attachment.file_name.clone()
+                } else {
+                    body.clone()
+                };
+                state.upsert_pending_outgoing_media(
+                    local_id.clone(),
+                    room_id.clone(),
+                    caption.clone(),
+                    attachment.local_path.clone(),
+                    PendingOutgoingMediaStatus::Uploading,
+                );
+                state.clear_error();
+                let snapshot = state.snapshot();
+                (self.ui_update)(snapshot);
+                SendPlan::Attachment {
+                    room_id,
+                    local_id,
+                    caption,
+                    local_path: attachment.local_path,
+                    content_type: attachment.content_type,
+                }
+            } else {
+                if body.is_empty() {
+                    debug!("ignoring empty send request");
+                    return false;
+                }
 
-            (room_id, client_txn_id)
+                let client_txn_id = format!(
+                    "desktop-send-{}",
+                    self.next_txn_id.fetch_add(1, Ordering::Relaxed)
+                );
+                state.mark_send_requested(client_txn_id.clone());
+                state.clear_error();
+                let snapshot = state.snapshot();
+                (self.ui_update)(snapshot);
+
+                SendPlan::Text {
+                    room_id,
+                    client_txn_id,
+                    body: body.clone(),
+                }
+            }
         };
 
-        info!(
-            room_id = %room_id,
-            client_txn_id = %client_txn_id,
-            body_len = body.len(),
-            "queueing room send"
+        match send_plan {
+            SendPlan::Text {
+                room_id,
+                client_txn_id,
+                body,
+            } => {
+                info!(
+                    room_id = %room_id,
+                    client_txn_id = %client_txn_id,
+                    body_len = body.len(),
+                    "queueing room send"
+                );
+                self.enqueue_command(send_message_command(room_id, client_txn_id, body));
+                true
+            }
+            SendPlan::Attachment {
+                room_id,
+                local_id,
+                caption,
+                local_path,
+                content_type,
+            } => {
+                let data = match fs::read(&local_path) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        error!(path = %local_path, error = %err, "failed to read attachment");
+                        let mut state = self.state.lock().expect(
+                            "desktop state lock poisoned while handling attachment read failure",
+                        );
+                        state.set_pending_outgoing_upload_failed(&local_id);
+                        state.set_error_text("Failed to read attachment file.");
+                        let snapshot = state.snapshot();
+                        (self.ui_update)(snapshot);
+                        return false;
+                    }
+                };
+
+                let upload_txn_id = format!(
+                    "desktop-upload-{}",
+                    self.next_txn_id.fetch_add(1, Ordering::Relaxed)
+                );
+                self.media_uploads_in_flight
+                    .lock()
+                    .expect("media uploads lock poisoned")
+                    .insert(
+                        upload_txn_id.clone(),
+                        PendingOutgoingUploadContext {
+                            room_id,
+                            local_id,
+                            caption,
+                            local_path,
+                            content_type: content_type.clone(),
+                        },
+                    );
+                self.enqueue_command(BackendCommand::UploadMedia {
+                    client_txn_id: upload_txn_id,
+                    content_type,
+                    data,
+                });
+                true
+            }
+        }
+    }
+
+    /// Open a file picker and stage one image attachment for the composer.
+    pub fn pick_attachment(&self) {
+        let Some(path) = FileDialog::new()
+            .add_filter("Images", &["jpg", "jpeg", "png", "gif"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("attachment")
+            .to_owned();
+        let local_path = path.to_string_lossy().to_string();
+        let metadata = match fs::metadata(&path) {
+            Ok(value) => value,
+            Err(err) => {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("desktop state lock poisoned while reading attachment metadata");
+                state.set_error_text(format!("Failed to read attachment metadata: {err}"));
+                let snapshot = state.snapshot();
+                (self.ui_update)(snapshot);
+                return;
+            }
+        };
+        let content_type = content_type_for_path(&path);
+
+        let mut state = self
+            .state
+            .lock()
+            .expect("desktop state lock poisoned while setting attachment");
+        match DesktopState::validate_attachment(local_path, file_name, content_type, metadata.len())
+        {
+            Ok(attachment) => {
+                state.set_pending_attachment(attachment);
+                state.clear_error();
+            }
+            Err(err) => state.set_error_text(err),
+        }
+        let snapshot = state.snapshot();
+        (self.ui_update)(snapshot);
+    }
+
+    /// Clear the staged composer attachment.
+    pub fn clear_attachment(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("desktop state lock poisoned while clearing attachment");
+        state.clear_pending_attachment();
+        let snapshot = state.snapshot();
+        (self.ui_update)(snapshot);
+    }
+
+    /// Retry downloading one media source for timeline rendering.
+    pub fn retry_media_download(&self, source: String) {
+        if source.trim().is_empty() {
+            return;
+        }
+        let source_ref = self
+            .state
+            .lock()
+            .expect("desktop state lock poisoned while resolving media source for retry")
+            .media_source_ref_for_key(&source)
+            .unwrap_or_else(|| MediaSourceRef::PlainMxc {
+                uri: source.clone(),
+            });
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("desktop state lock poisoned while retrying media download");
+            state.mark_media_download_started(source.clone());
+            let snapshot = state.snapshot();
+            (self.ui_update)(snapshot);
+        }
+        enqueue_media_download(
+            &self.command_tx,
+            source_ref,
+            source,
+            &self.media_downloads_in_flight,
+            &self.media_download_txn_to_source,
         );
-        self.enqueue_command(send_message_command(room_id, client_txn_id, body));
-        true
+    }
+
+    /// Retry a failed outgoing media item by local ID.
+    pub fn retry_outgoing_media(&self, local_id: String) {
+        let Some(pending) = self
+            .state
+            .lock()
+            .expect("desktop state lock poisoned while loading pending outgoing media")
+            .pending_outgoing_media(&local_id)
+        else {
+            return;
+        };
+
+        if let Some(source) = pending.media_source.clone() {
+            let send_txn_id = format!(
+                "desktop-send-media-{}",
+                self.next_txn_id.fetch_add(1, Ordering::Relaxed)
+            );
+            self.media_send_txn_to_local_id
+                .lock()
+                .expect("media send txn map lock poisoned")
+                .insert(send_txn_id.clone(), local_id.clone());
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("desktop state lock poisoned while retrying outgoing media send");
+                state.set_pending_outgoing_sending(&local_id, source.clone());
+                let snapshot = state.snapshot();
+                (self.ui_update)(snapshot);
+            }
+            self.enqueue_command(BackendCommand::SendMediaMessage {
+                room_id: pending.room_id,
+                client_txn_id: send_txn_id,
+                media: OutgoingMedia::Image {
+                    body: pending.caption,
+                    source: MediaSourceRef::PlainMxc { uri: source },
+                    metadata: None,
+                },
+            });
+            return;
+        }
+
+        let data = match fs::read(&pending.local_path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                error!(error = %err, path = %pending.local_path, "failed to read pending media");
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("desktop state lock poisoned while handling pending media read error");
+                state.set_error_text("Failed to read pending media for retry.");
+                let snapshot = state.snapshot();
+                (self.ui_update)(snapshot);
+                return;
+            }
+        };
+
+        let upload_txn_id = format!(
+            "desktop-upload-{}",
+            self.next_txn_id.fetch_add(1, Ordering::Relaxed)
+        );
+        self.media_uploads_in_flight
+            .lock()
+            .expect("media uploads lock poisoned")
+            .insert(
+                upload_txn_id.clone(),
+                PendingOutgoingUploadContext {
+                    room_id: pending.room_id,
+                    local_id,
+                    caption: pending.caption,
+                    local_path: pending.local_path.clone(),
+                    content_type: content_type_for_path(Path::new(&pending.local_path)),
+                },
+            );
+        self.enqueue_command(BackendCommand::UploadMedia {
+            client_txn_id: upload_txn_id,
+            content_type: content_type_for_path(Path::new(&pending.local_path)),
+            data,
+        });
+    }
+
+    /// Remove one pending outgoing media item from the timeline.
+    pub fn remove_outgoing_media(&self, local_id: String) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("desktop state lock poisoned while removing outgoing media");
+        state.remove_pending_outgoing_media(&local_id);
+        let snapshot = state.snapshot();
+        (self.ui_update)(snapshot);
     }
 
     /// Accept a room invite by room ID.
@@ -966,6 +1325,12 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+fn next_auto_txn_id(prefix: &str) -> String {
+    static NEXT_AUTO_TXN_ID: AtomicU64 = AtomicU64::new(1);
+    let id = NEXT_AUTO_TXN_ID.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{id}")
+}
+
 fn command_kind(command: &BackendCommand) -> &'static str {
     match command {
         BackendCommand::Init { .. } => "Init",
@@ -980,6 +1345,7 @@ fn command_kind(command: &BackendCommand) -> &'static str {
         BackendCommand::PaginateBack { .. } => "PaginateBack",
         BackendCommand::SendDmText { .. } => "SendDmText",
         BackendCommand::SendMessage { .. } => "SendMessage",
+        BackendCommand::SendMediaMessage { .. } => "SendMediaMessage",
         BackendCommand::EditMessage { .. } => "EditMessage",
         BackendCommand::RedactMessage { .. } => "RedactMessage",
         BackendCommand::UploadMedia { .. } => "UploadMedia",
@@ -1009,6 +1375,239 @@ fn event_kind(event: &BackendEvent) -> &'static str {
         BackendEvent::RecoveryRestoreAck(_) => "RecoveryRestoreAck",
         BackendEvent::CryptoStatus(_) => "CryptoStatus",
         BackendEvent::FatalError { .. } => "FatalError",
+    }
+}
+
+fn create_media_cache(data_dir: &Path) -> Result<MediaCache, String> {
+    MediaCache::new(data_dir).map_err(|err| err.to_string())
+}
+
+fn enqueue_media_download(
+    command_tx: &mpsc::UnboundedSender<BackendCommand>,
+    source: MediaSourceRef,
+    source_key: String,
+    media_downloads_in_flight: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+    media_download_txn_to_source: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+) {
+    let txn_id = next_auto_txn_id("desktop-media-download");
+    media_downloads_in_flight
+        .lock()
+        .expect("media downloads lock poisoned")
+        .insert(source_key.clone(), txn_id.clone());
+    media_download_txn_to_source
+        .lock()
+        .expect("media download txn lock poisoned")
+        .insert(txn_id.clone(), source_key);
+
+    let _ = command_tx.send(BackendCommand::DownloadMedia {
+        client_txn_id: txn_id,
+        source,
+    });
+}
+
+fn trigger_lazy_media_downloads(
+    state: &Arc<Mutex<DesktopState>>,
+    command_tx: &mpsc::UnboundedSender<BackendCommand>,
+    media_cache: &Arc<Mutex<MediaCache>>,
+    media_downloads_in_flight: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+    media_download_txn_to_source: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+) {
+    let sources = state
+        .lock()
+        .expect("desktop state lock poisoned while selecting lazy media")
+        .selected_room_uncached_image_sources();
+
+    for source in sources {
+        let source_key = source.to_string();
+        if media_downloads_in_flight
+            .lock()
+            .expect("media downloads lock poisoned")
+            .contains_key(&source_key)
+        {
+            continue;
+        }
+
+        if let Some(path) = media_cache
+            .lock()
+            .expect("media cache lock poisoned")
+            .get(&source_key)
+        {
+            let mut state = state
+                .lock()
+                .expect("desktop state lock poisoned while updating cached media");
+            state.mark_media_download_ready(source_key.clone(), path.to_string_lossy().to_string());
+            continue;
+        }
+
+        {
+            let mut state = state
+                .lock()
+                .expect("desktop state lock poisoned while starting media download");
+            state.mark_media_download_started(source_key.clone());
+        }
+        enqueue_media_download(
+            command_tx,
+            source,
+            source_key,
+            media_downloads_in_flight,
+            media_download_txn_to_source,
+        );
+    }
+}
+
+fn handle_media_download_ack(
+    state: &Arc<Mutex<DesktopState>>,
+    media_cache: &Arc<Mutex<MediaCache>>,
+    media_downloads_in_flight: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+    media_download_txn_to_source: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+    ack: &MediaDownloadAck,
+) {
+    let source = media_download_txn_to_source
+        .lock()
+        .expect("media download txn lock poisoned")
+        .remove(&ack.client_txn_id)
+        .unwrap_or_else(|| ack.source.to_string());
+    media_downloads_in_flight
+        .lock()
+        .expect("media downloads lock poisoned")
+        .remove(&source);
+
+    if ack.error_code.is_some() || ack.data.is_none() {
+        let mut state = state
+            .lock()
+            .expect("desktop state lock poisoned while handling failed media download");
+        state.mark_media_download_failed(source);
+        return;
+    }
+
+    let bytes = ack.data.as_ref().expect("checked is_some");
+    let cached = media_cache
+        .lock()
+        .expect("media cache lock poisoned")
+        .insert(&source, bytes, ack.content_type.as_deref());
+    match cached {
+        Ok(path) => {
+            let mut state = state
+                .lock()
+                .expect("desktop state lock poisoned while marking media ready");
+            state.mark_media_download_ready(source, path.to_string_lossy().to_string());
+        }
+        Err(err) => {
+            error!(
+                error = %err,
+                source = %source,
+                content_type = ?ack.content_type,
+                bytes_len = bytes.len(),
+                "failed to cache downloaded media"
+            );
+            let mut state = state
+                .lock()
+                .expect("desktop state lock poisoned while marking media cache failure");
+            state.mark_media_download_failed(source);
+        }
+    }
+}
+
+fn handle_media_upload_ack(
+    command_tx: &mpsc::UnboundedSender<BackendCommand>,
+    state: &Arc<Mutex<DesktopState>>,
+    media_uploads_in_flight: &Arc<
+        Mutex<std::collections::HashMap<String, PendingOutgoingUploadContext>>,
+    >,
+    media_send_txn_to_local_id: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+    ack: &MediaUploadAck,
+) {
+    let Some(context) = media_uploads_in_flight
+        .lock()
+        .expect("media uploads lock poisoned")
+        .remove(&ack.client_txn_id)
+    else {
+        return;
+    };
+
+    if ack.error_code.is_some() {
+        let mut state = state
+            .lock()
+            .expect("desktop state lock poisoned while handling upload failure");
+        state.set_pending_outgoing_upload_failed(&context.local_id);
+        state.set_error_text(format!(
+            "media upload failed ({})",
+            ack.error_code.as_deref().unwrap_or("unknown")
+        ));
+        return;
+    }
+
+    let Some(content_uri) = ack.content_uri.clone() else {
+        let mut state = state
+            .lock()
+            .expect("desktop state lock poisoned while handling upload failure");
+        state.set_pending_outgoing_upload_failed(&context.local_id);
+        state.set_error_text("media upload failed (missing content uri)");
+        return;
+    };
+
+    {
+        let mut state = state
+            .lock()
+            .expect("desktop state lock poisoned while transitioning to sending");
+        state.set_pending_outgoing_sending(&context.local_id, content_uri.clone());
+    }
+
+    let send_txn_id = next_auto_txn_id("desktop-send-media");
+    media_send_txn_to_local_id
+        .lock()
+        .expect("media send txn map lock poisoned")
+        .insert(send_txn_id.clone(), context.local_id.clone());
+
+    let _ = command_tx.send(BackendCommand::SendMediaMessage {
+        room_id: context.room_id,
+        client_txn_id: send_txn_id,
+        media: OutgoingMedia::Image {
+            body: context.caption,
+            source: MediaSourceRef::PlainMxc { uri: content_uri },
+            metadata: None,
+        },
+    });
+}
+
+fn handle_media_send_ack(
+    state: &Arc<Mutex<DesktopState>>,
+    media_send_txn_to_local_id: &Arc<Mutex<std::collections::HashMap<String, String>>>,
+    ack: &SendAck,
+) {
+    let Some(local_id) = media_send_txn_to_local_id
+        .lock()
+        .expect("media send txn map lock poisoned")
+        .remove(&ack.client_txn_id)
+    else {
+        return;
+    };
+
+    let mut state = state
+        .lock()
+        .expect("desktop state lock poisoned while handling send ack");
+    if ack.error_code.is_some() {
+        state.set_pending_outgoing_send_failed(&local_id);
+        state.set_error_text(format!(
+            "media send failed ({})",
+            ack.error_code.as_deref().unwrap_or("unknown")
+        ));
+    } else {
+        state.remove_pending_outgoing_media(&local_id);
+    }
+}
+
+fn content_type_for_path(path: &Path) -> String {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg" | "jpeg") => "image/jpeg".to_owned(),
+        Some("png") => "image/png".to_owned(),
+        Some("gif") => "image/gif".to_owned(),
+        _ => "application/octet-stream".to_owned(),
     }
 }
 

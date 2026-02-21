@@ -15,8 +15,18 @@ export struct RoomRow {
 
 export struct MessageRow {
     event_id: string,
+    local_id: string,
     sender: string,
     body: string,
+    event_kind: string,
+    caption: string,
+    media_status: string,
+    media_source: string,
+    media_cached_path: string,
+    media_image: image,
+    has_media_image: bool,
+    can_retry: bool,
+    can_remove: bool,
     is_own: bool,
 }
 
@@ -42,6 +52,11 @@ export component MainWindow inherits Window {
     callback room-invite-accept-requested(room_id: string);
     callback room-invite-reject-requested(room_id: string);
     callback send-message-requested(text: string) -> bool;
+    callback attachment-pick-requested();
+    callback attachment-clear-requested();
+    callback media-retry-requested(source: string);
+    callback outgoing-media-retry-requested(local_id: string);
+    callback outgoing-media-remove-requested(local_id: string);
     callback timeline-scrolled(viewport_y: float);
     callback sidebar-width-requested(width_px: float, window_width_px: float);
 
@@ -63,6 +78,8 @@ export component MainWindow inherits Window {
     in-out property <bool> security-show-restore-input: false;
     in-out property <string> security-restore-button-text: "Restore";
     in-out property <bool> security-restore-in-flight: false;
+    in-out property <bool> show-media-screen: false;
+    in-out property <image> media-screen-image;
 
     in property <[RoomRow]> rooms;
     in property <[MessageRow]> messages;
@@ -71,6 +88,8 @@ export component MainWindow inherits Window {
     in property <string> error-text: "";
     in property <bool> has-error: false;
     in property <bool> can-send: false;
+    in property <string> composer-attachment-name: "";
+    in property <bool> has-composer-attachment: false;
 
     menu_bar := MenuBar {
         Menu {
@@ -369,7 +388,84 @@ export component MainWindow inherits Window {
                             overflow: elide;
                         }
 
-                        body := Text {
+                        if message.event_kind == "image" : VerticalLayout {
+                            x: 12px;
+                            y: sender.y + sender.height + 6px;
+                            width: parent.width - 24px;
+                            spacing: 6px;
+
+                            if message.has_media_image : Image {
+                                source: message.media_image;
+                                width: min(parent.width, 360px);
+                                height: 220px;
+                                image-fit: contain;
+
+                                TouchArea {
+                                    width: parent.width;
+                                    height: parent.height;
+                                    clicked => {
+                                        root.media-screen-image = message.media_image;
+                                        root.show-media-screen = true;
+                                    }
+                                }
+                            }
+
+                            if !message.has_media_image : Rectangle {
+                                width: parent.width;
+                                height: 88px;
+                                border-radius: 8px;
+                                border-width: 1px;
+                                border-color: #4a5772;
+                                background: #1b2332;
+
+                                Text {
+                                    x: 10px;
+                                    y: 12px;
+                                    width: parent.width - 20px;
+                                    text: "Image: " + message.media_status;
+                                    color: #d6e1ff;
+                                    overflow: elide;
+                                }
+
+                                if message.can_retry : Button {
+                                    x: parent.width - self.width - 10px;
+                                    y: parent.height - self.height - 10px;
+                                    width: 72px;
+                                    text: "Retry";
+                                    clicked => {
+                                        root.media-retry-requested(message.media_source);
+                                    }
+                                }
+                            }
+
+                            if message.caption != "" : Text {
+                                text: message.caption;
+                                color: #f2f6ff;
+                                wrap: word-wrap;
+                                horizontal-alignment: left;
+                            }
+
+                            if message.can_retry && message.local_id != "" : HorizontalLayout {
+                                spacing: 8px;
+
+                                Button {
+                                    text: "Retry";
+                                    width: 72px;
+                                    clicked => {
+                                        root.outgoing-media-retry-requested(message.local_id);
+                                    }
+                                }
+                                if message.can_remove : Button {
+                                    text: "Remove";
+                                    width: 86px;
+                                    clicked => {
+                                        root.outgoing-media-remove-requested(message.local_id);
+                                    }
+                                }
+                            }
+                        }
+
+                        if message.event_kind == "text" : Text {
                             x: 12px;
                             y: sender.y + sender.height + 6px;
                             width: parent.width - 24px;
@@ -379,7 +475,9 @@ export component MainWindow inherits Window {
                             horizontal-alignment: left;
                         }
 
-                        height: body.y + body.height + 10px;
+                        height: message.event_kind == "image"
+                            ? (sender.y + sender.height + 6px + 220px)
+                            : (sender.y + sender.height + 34px);
                     }
                 }
             }
@@ -405,7 +503,7 @@ export component MainWindow inherits Window {
                 input := TextEdit {
                     x: 10px;
                     y: 10px;
-                    width: parent.width - send-btn.width - 28px;
+                    width: parent.width - 220px;
                     height: parent.height - 20px;
                     text <=> root.composer-text;
                     enabled: root.can-send;
@@ -432,6 +530,45 @@ export component MainWindow inherits Window {
                     clicked => {
                         if (root.send-message-requested(root.composer-text)) {
                             root.composer-text = "";
+                        }
+                    }
+                }
+
+                attach-btn := Button {
+                    x: send-btn.x - self.width - 8px;
+                    y: (parent.height - self.height) / 2;
+                    width: 92px;
+                    text: "Attach";
+                    enabled: root.can-send;
+                    clicked => {
+                        root.attachment-pick-requested();
+                    }
+                }
+
+                if root.has-composer-attachment : Rectangle {
+                    x: 10px;
+                    y: parent.height - self.height - 8px;
+                    width: parent.width - 20px;
+                    height: 24px;
+                    border-radius: 6px;
+                    background: #24314a;
+
+                    Text {
+                        x: 8px;
+                        y: 4px;
+                        width: parent.width - clear-attachment-btn.width - 20px;
+                        text: "Attachment: " + root.composer-attachment-name;
+                        color: #d6e1ff;
+                        overflow: elide;
+                    }
+
+                    clear-attachment-btn := Button {
+                        x: parent.width - self.width - 6px;
+                        y: 1px;
+                        width: 56px;
+                        text: "Clear";
+                        clicked => {
+                            root.attachment-clear-requested();
                         }
                     }
                 }
@@ -760,6 +897,31 @@ export component MainWindow inherits Window {
                     root.security-dialog-dismissed();
                 }
             }
+        }
+    }
+
+    if root.show-media-screen : Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: #000000cc;
+
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            clicked => {
+                root.show-media-screen = false;
+            }
+        }
+
+        Image {
+            x: 24px;
+            y: 24px;
+            width: parent.width - 48px;
+            height: parent.height - 48px;
+            source: root.media-screen-image;
+            image-fit: contain;
         }
     }
 }
