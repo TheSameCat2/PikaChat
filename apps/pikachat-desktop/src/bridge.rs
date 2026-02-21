@@ -321,7 +321,7 @@ impl DesktopBridge {
         remember_password: bool,
     ) {
         let user_id = user_id.trim().to_owned();
-        let password = password.trim().to_owned();
+        let password = password.to_owned();
         let homeserver = match normalize_homeserver(homeserver) {
             Ok(value) => value,
             Err(err) => {
