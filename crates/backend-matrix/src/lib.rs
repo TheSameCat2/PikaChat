@@ -2477,9 +2477,9 @@ impl MatrixRuntime {
         }
 
         let remote_logout_error = backend.logout().await.err();
+        self.wipe_local_persistence(&init_state.data_dir)?;
         drop(backend);
         self.backend = None;
-        self.wipe_local_persistence(&init_state.data_dir)?;
         self.init_state = None;
         self.runtime_tuning = RuntimeTuning::default();
         self.pagination_tokens.clear();
