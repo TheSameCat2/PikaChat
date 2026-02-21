@@ -10,6 +10,7 @@ build = "build.rs"
 arboard = "3.6.1"
 backend-core = { path = "../../crates/backend-core" }
 backend-matrix = { path = "../../crates/backend-matrix" }
+image = { version = "0.25.9", default-features = false, features = ["gif"] }
 rfd = "0.15.4"
 serde.workspace = true
 serde_json.workspace = true
