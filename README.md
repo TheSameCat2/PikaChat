@@ -40,6 +40,35 @@ PikaChat is now in an early but functional desktop MVP phase:
   - `Restore Identity...` (recovery key/passphrase restore flow)
 - Recovery dialogs include copy-key UX and restore in-flight protections.
 
+## Roadmap
+
+### Phase 1
+- [x] Matrix Backend Runtime
+- [x] Basic Sign In/Out
+- [x] Room List/Timeline Rendering
+  - [ ] Room Names/Group Names
+- [x] Timeline Pagination
+- [x] Timeline Event Rendering
+- [x] Plain-Text Message Send
+- [x] Back Up/Restore Identity
+- [x] E2EE
+
+### Phase 2
+
+- [ ] Media Upload/Download (Images)
+- [ ] Media Upload/Download (Video)
+- [ ] Reactions
+- [ ] Voice Channels
+- [ ] Video Channels
+- [ ] Room Members/Invites
+- [ ] Room Settings
+
+### Phase 3
+
+- [ ] Theming (Customizable Pallet/Corner Images)
+- [ ] Sound Board (Voice/Video Channels)
+- [ ] Multi-Account Management
+ 
 ## Architecture (Current)
 
 - `crates/backend-core`:
