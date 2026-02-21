@@ -1,6 +1,10 @@
 //! Persisted login metadata used by desktop login/session restore flow.
 
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -44,9 +48,47 @@ pub fn save_auth_profile(path: &Path, profile: &AuthProfile) -> Result<(), Strin
         })?;
     }
 
-    let encoded = serde_json::to_string(profile).map_err(|err| err.to_string())?;
-    fs::write(path, encoded)
-        .map_err(|err| format!("failed writing auth profile {}: {err}", path.display()))
+    let encoded = serde_json::to_vec(profile).map_err(|err| err.to_string())?;
+    let temp_path = auth_profile_temp_path(path);
+    fs::write(&temp_path, encoded)
+        .map_err(|err| format!("failed writing temp auth profile {}: {err}", temp_path.display()))?;
+
+    if let Err(rename_err) = fs::rename(&temp_path, path) {
+        // Windows does not allow replacing existing files via rename.
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                let _ = fs::remove_file(&temp_path);
+                return Err(format!(
+                    "failed replacing auth profile {} after rename error ({rename_err}): {err}",
+                    path.display()
+                ));
+            }
+        }
+        fs::rename(&temp_path, path).map_err(|err| {
+            let _ = fs::remove_file(&temp_path);
+            format!(
+                "failed writing auth profile {} after temp write: {err}",
+                path.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn auth_profile_temp_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("auth-profile.json");
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    parent.join(format!(".{file_name}.{now_nanos}.tmp"))
 }
 
 /// Remove profile JSON from disk.
