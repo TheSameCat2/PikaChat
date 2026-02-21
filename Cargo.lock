@@ -4899,6 +4899,7 @@ dependencies = [
  "arboard",
  "backend-core",
  "backend-matrix",
+ "image",
  "rfd",
  "serde",
  "serde_json",

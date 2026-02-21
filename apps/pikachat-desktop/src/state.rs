@@ -1,11 +1,12 @@
 //! Frontend-facing state reducer for `pikachat-desktop`.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use backend_core::types::{InviteAction, InviteActionAck, RoomMembership};
 use backend_core::{
-    BackendEvent, BackendLifecycleState, KeyBackupState, RecoveryState, RecoveryStatus,
-    MediaSourceRef, RoomSummary, SendAck, SyncStatus, TimelineContent, TimelineItem, TimelineOp,
+    BackendEvent, BackendLifecycleState, KeyBackupState, MediaSourceRef, RecoveryState,
+    RecoveryStatus, RoomSummary, SendAck, SyncStatus, TimelineContent, TimelineItem, TimelineOp,
 };
 use tracing::{debug, trace, warn};
 
@@ -52,6 +53,9 @@ pub struct MessageView {
     pub media_status: String,
     pub media_source: Option<String>,
     pub media_cached_path: Option<String>,
+    pub media_key: String,
+    pub media_is_gif: bool,
+    pub media_hint: Option<String>,
     pub can_retry: bool,
     pub can_remove: bool,
     pub is_own: bool,
@@ -155,6 +159,7 @@ pub struct PendingOutgoingMedia {
     pub sender: String,
     pub caption: String,
     pub local_path: String,
+    pub content_type: Option<String>,
     pub media_source: Option<String>,
     pub status: PendingOutgoingMediaStatus,
 }
@@ -715,14 +720,17 @@ impl DesktopState {
     }
 
     pub fn media_source_ref_for_key(&self, source_key: &str) -> Option<MediaSourceRef> {
-        self.timelines.values().flat_map(|items| items.iter()).find_map(|item| {
-            let source = image_source_of_item(item)?;
-            if media_source_key(&source) == source_key {
-                Some(source)
-            } else {
-                None
-            }
-        })
+        self.timelines
+            .values()
+            .flat_map(|items| items.iter())
+            .find_map(|item| {
+                let source = image_source_of_item(item)?;
+                if media_source_key(&source) == source_key {
+                    Some(source)
+                } else {
+                    None
+                }
+            })
     }
 
     pub fn mark_media_download_started(&mut self, source: String) {
@@ -773,6 +781,7 @@ impl DesktopState {
                 local_id,
                 sender: self.own_user_id.clone(),
                 caption,
+                content_type: infer_media_content_type_from_local_path(&local_path),
                 local_path,
                 media_source: None,
                 status,
@@ -1008,6 +1017,11 @@ impl DesktopState {
                                 .unwrap_or(MediaStatus::Missing)
                                 .as_ui_label()
                                 .to_owned();
+                            let media_key = make_stable_media_key(
+                                item.event_id.as_deref(),
+                                None,
+                                Some(&source),
+                            );
                             MessageView {
                                 event_id: item.event_id.clone(),
                                 local_id: None,
@@ -1019,6 +1033,9 @@ impl DesktopState {
                                 media_source: Some(source),
                                 media_cached_path: media
                                     .and_then(|state| state.cached_path.clone()),
+                                media_key,
+                                media_is_gif: timeline_item_is_gif(item),
+                                media_hint: None,
                                 can_retry: media.map(|state| state.status)
                                     == Some(MediaStatus::Failed),
                                 can_remove: false,
@@ -1035,6 +1052,9 @@ impl DesktopState {
                                 media_status: "none".to_owned(),
                                 media_source: None,
                                 media_cached_path: None,
+                                media_key: String::new(),
+                                media_is_gif: false,
+                                media_hint: None,
                                 can_retry: false,
                                 can_remove: false,
                                 is_own: item.sender == self.own_user_id,
@@ -1055,14 +1075,24 @@ impl DesktopState {
 
         messages.extend(pending.into_iter().map(|item| MessageView {
             event_id: None,
-            local_id: Some(item.local_id),
+            local_id: Some(item.local_id.clone()),
             sender: item.sender,
             body: item.caption.clone(),
             event_kind: "image".to_owned(),
             caption: item.caption,
             media_status: item.status.as_ui_label().to_owned(),
-            media_source: item.media_source,
-            media_cached_path: Some(item.local_path),
+            media_source: item.media_source.clone(),
+            media_cached_path: Some(item.local_path.clone()),
+            media_key: make_stable_media_key(
+                None,
+                Some(item.local_id.as_str()),
+                item.media_source.as_deref(),
+            ),
+            media_is_gif: pending_outgoing_media_is_gif(
+                &item.local_path,
+                item.content_type.as_deref(),
+            ),
+            media_hint: None,
             can_retry: item.status.can_retry(),
             can_remove: true,
             is_own: true,
@@ -1208,6 +1238,69 @@ fn media_source_key(source: &MediaSourceRef) -> String {
     source.to_string()
 }
 
+fn make_stable_media_key(
+    event_id: Option<&str>,
+    local_id: Option<&str>,
+    media_source: Option<&str>,
+) -> String {
+    if let Some(event_id) = event_id.filter(|value| !value.is_empty()) {
+        return format!("evt:{event_id}");
+    }
+    if let Some(local_id) = local_id.filter(|value| !value.is_empty()) {
+        return format!("local:{local_id}");
+    }
+    if let Some(media_source) = media_source.filter(|value| !value.is_empty()) {
+        return format!("src:{media_source}");
+    }
+    String::new()
+}
+
+fn timeline_item_is_gif(item: &TimelineItem) -> bool {
+    match &item.content {
+        TimelineContent::Image(image) => content_type_is_gif(
+            image
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.content_type.as_deref()),
+        ),
+        _ => false,
+    }
+}
+
+fn pending_outgoing_media_is_gif(local_path: &str, content_type: Option<&str>) -> bool {
+    local_path_is_gif(local_path) || content_type_is_gif(content_type)
+}
+
+fn local_path_is_gif(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("gif"))
+        .unwrap_or(false)
+}
+
+fn content_type_is_gif(content_type: Option<&str>) -> bool {
+    content_type
+        .map(str::trim)
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .map(|value| value.eq_ignore_ascii_case("image/gif"))
+        .unwrap_or(false)
+}
+
+fn infer_media_content_type_from_local_path(path: &str) -> Option<String> {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())?
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "gif" => Some("image/gif".to_owned()),
+        "jpg" | "jpeg" => Some("image/jpeg".to_owned()),
+        "png" => Some("image/png".to_owned()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1218,6 +1311,30 @@ mod tests {
             sender: sender.to_owned(),
             body: body.to_owned(),
             content: TimelineContent::Text,
+            timestamp_ms: 1_700_000_000,
+        }
+    }
+
+    fn image_item(
+        event_id: Option<&str>,
+        sender: &str,
+        body: &str,
+        source: &str,
+        content_type: Option<&str>,
+    ) -> TimelineItem {
+        TimelineItem {
+            event_id: event_id.map(ToOwned::to_owned),
+            sender: sender.to_owned(),
+            body: body.to_owned(),
+            content: TimelineContent::Image(backend_core::TimelineImageContent {
+                source: MediaSourceRef::PlainMxc {
+                    uri: source.to_owned(),
+                },
+                metadata: Some(backend_core::TimelineImageMetadata {
+                    content_type: content_type.map(ToOwned::to_owned),
+                    ..Default::default()
+                }),
+            }),
             timestamp_ms: 1_700_000_000,
         }
     }
@@ -1496,6 +1613,85 @@ mod tests {
         assert_eq!(snapshot.messages[0].event_id.as_deref(), Some("$2"));
         assert_eq!(snapshot.messages[1].event_id.as_deref(), Some("$1"));
         assert_eq!(snapshot.messages[1].body, "v1-new");
+    }
+
+    #[test]
+    fn media_key_generation_prefers_event_then_local_then_source() {
+        assert_eq!(
+            make_stable_media_key(Some("$evt"), Some("local-1"), Some("mxc://example/source")),
+            "evt:$evt"
+        );
+        assert_eq!(
+            make_stable_media_key(None, Some("local-1"), Some("mxc://example/source")),
+            "local:local-1"
+        );
+        assert_eq!(
+            make_stable_media_key(None, None, Some("mxc://example/source")),
+            "src:mxc://example/source"
+        );
+    }
+
+    #[test]
+    fn timeline_image_uses_metadata_content_type_for_gif_detection() {
+        let mut state = DesktopState::new("@alice:example.org", 50);
+        state.replace_rooms(vec![room(
+            "!r1:example.org",
+            "R1",
+            0,
+            0,
+            RoomMembership::Joined,
+        )]);
+        state.select_room("!r1:example.org".to_owned());
+        state.handle_backend_event(BackendEvent::RoomTimelineSnapshot {
+            room_id: "!r1:example.org".to_owned(),
+            items: vec![
+                image_item(
+                    Some("$gif"),
+                    "@bob:example.org",
+                    "gif image",
+                    "mxc://example.org/gif",
+                    Some("IMAGE/GIF"),
+                ),
+                image_item(
+                    Some("$png"),
+                    "@bob:example.org",
+                    "png image",
+                    "mxc://example.org/png",
+                    Some("image/png"),
+                ),
+            ],
+        });
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.messages.len(), 2);
+        assert_eq!(snapshot.messages[0].media_key, "evt:$gif");
+        assert!(snapshot.messages[0].media_is_gif);
+        assert!(!snapshot.messages[1].media_is_gif);
+    }
+
+    #[test]
+    fn pending_outgoing_gif_detects_local_gif_extension() {
+        let mut state = DesktopState::new("@alice:example.org", 50);
+        state.replace_rooms(vec![room(
+            "!r1:example.org",
+            "R1",
+            0,
+            0,
+            RoomMembership::Joined,
+        )]);
+        state.select_room("!r1:example.org".to_owned());
+        state.upsert_pending_outgoing_media(
+            "local-1".to_owned(),
+            "!r1:example.org".to_owned(),
+            "cat gif".to_owned(),
+            "/tmp/cat.GIF".to_owned(),
+            PendingOutgoingMediaStatus::Uploading,
+        );
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.messages.len(), 1);
+        assert_eq!(snapshot.messages[0].media_key, "local:local-1");
+        assert!(snapshot.messages[0].media_is_gif);
     }
 
     #[test]

@@ -23,6 +23,9 @@ export struct MessageRow {
     media_status: string,
     media_source: string,
     media_cached_path: string,
+    media_key: string,
+    media_is_gif: bool,
+    media_hint: string,
     media_image: image,
     has_media_image: bool,
     can_retry: bool,
@@ -57,6 +60,9 @@ export component MainWindow inherits Window {
     callback media-retry-requested(source: string);
     callback outgoing-media-retry-requested(local_id: string);
     callback outgoing-media-remove-requested(local_id: string);
+    callback gif-visible-ping(media_key: string);
+    callback media-screen-open-requested(media_key: string);
+    callback media-screen-close-requested();
     callback timeline-scrolled(viewport_y: float);
     callback sidebar-width-requested(width_px: float, window_width_px: float);
 
@@ -388,10 +394,22 @@ export component MainWindow inherits Window {
                             overflow: elide;
                         }
 
-                        if message.event_kind == "image" : VerticalLayout {
+                        gif-visible-timer := Timer {
+                            interval: 250ms;
+                            running: message.event_kind == "image"
+                                && message.media_is_gif
+                                && message.has_media_image
+                                && message.media_key != "";
+                            triggered => {
+                                root.gif-visible-ping(message.media_key);
+                            }
+                        }
+
+                        image-content := VerticalLayout {
                             x: 12px;
                             y: sender.y + sender.height + 6px;
                             width: parent.width - 24px;
+                            visible: message.event_kind == "image";
                             spacing: 6px;
 
                             if message.has_media_image : Image {
@@ -404,8 +422,7 @@ export component MainWindow inherits Window {
                                     width: parent.width;
                                     height: parent.height;
                                     clicked => {
-                                        root.media-screen-image = message.media_image;
-                                        root.show-media-screen = true;
+                                        root.media-screen-open-requested(message.media_key);
                                     }
                                 }
                             }
@@ -441,6 +458,14 @@ export component MainWindow inherits Window {
                             if message.caption != "" : Text {
                                 text: message.caption;
                                 color: #f2f6ff;
+                                wrap: word-wrap;
+                                horizontal-alignment: left;
+                            }
+
+                            if message.media_hint != "" : Text {
+                                text: message.media_hint;
+                                color: #9eb2dc;
+                                font-size: 12px;
                                 wrap: word-wrap;
                                 horizontal-alignment: left;
                             }
@@ -911,7 +936,7 @@ export component MainWindow inherits Window {
             width: parent.width;
             height: parent.height;
             clicked => {
-                root.show-media-screen = false;
+                root.media-screen-close-requested();
             }
         }
 
