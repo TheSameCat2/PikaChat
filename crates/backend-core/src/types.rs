@@ -140,6 +140,43 @@ pub enum BackendCommand {
         /// `mxc://` URI source.
         source: String,
     },
+    /// Fetch latest local/server key-backup and recovery status summary.
+    GetRecoveryStatus,
+    /// Enable recovery and server-side room-key backups.
+    ///
+    /// On success emits `BackendEvent::RecoveryEnableAck` with a generated
+    /// recovery key that should be shown to the user and stored safely.
+    EnableRecovery {
+        /// Frontend-provided transaction ID echoed in `RecoveryEnableAck`.
+        client_txn_id: String,
+        /// Optional passphrase to derive secret-storage/recovery material.
+        passphrase: Option<String>,
+        /// Whether to wait for initial room-key upload to settle before acking.
+        wait_for_backups_to_upload: bool,
+    },
+    /// Reset identity backup/recovery and create a new recovery key.
+    ///
+    /// This flow deletes the active server-side backup and creates a fresh
+    /// backup/recovery setup. Old encrypted history that depended on the prior
+    /// backup key may become unrecoverable if that key was lost.
+    ///
+    /// On success emits `BackendEvent::RecoveryEnableAck` with the new
+    /// generated recovery key.
+    ResetRecovery {
+        /// Frontend-provided transaction ID echoed in `RecoveryEnableAck`.
+        client_txn_id: String,
+        /// Optional passphrase to derive secret-storage/recovery material.
+        passphrase: Option<String>,
+        /// Whether to wait for initial room-key upload to settle before acking.
+        wait_for_backups_to_upload: bool,
+    },
+    /// Recover E2EE secrets from secret storage using a recovery key/passphrase.
+    RecoverSecrets {
+        /// Frontend-provided transaction ID echoed in `RecoveryRestoreAck`.
+        client_txn_id: String,
+        /// Recovery key or passphrase used to unlock secret storage.
+        recovery_key: String,
+    },
     /// Logout and clear persisted session state.
     Logout,
 }
@@ -233,6 +270,71 @@ pub struct MediaDownloadAck {
     pub error_code: Option<String>,
 }
 
+/// Coarse-grained key-backup state projected from Matrix SDK internals.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum KeyBackupState {
+    /// Backup state has not been determined yet.
+    Unknown,
+    /// Client is creating a new backup on the homeserver.
+    Creating,
+    /// Client is enabling an existing backup.
+    Enabling,
+    /// Client is resuming backup from existing local state.
+    Resuming,
+    /// Backup is enabled and usable.
+    Enabled,
+    /// Client is downloading keys from backup.
+    Downloading,
+    /// Client is disabling/deleting backup.
+    Disabling,
+}
+
+/// Coarse-grained secret-storage recovery state.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RecoveryState {
+    /// Recovery state has not been determined yet.
+    Unknown,
+    /// Recovery is fully configured and usable.
+    Enabled,
+    /// Recovery/secret-storage is disabled.
+    Disabled,
+    /// Recovery is partially configured but missing some secrets.
+    Incomplete,
+}
+
+/// Consolidated backup/recovery readiness summary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryStatus {
+    /// Current local key-backup state.
+    pub backup_state: KeyBackupState,
+    /// Whether this client currently has backups enabled locally.
+    pub backup_enabled: bool,
+    /// Whether a backup currently exists on the homeserver.
+    pub backup_exists_on_server: bool,
+    /// Current recovery/secret-storage state.
+    pub recovery_state: RecoveryState,
+}
+
+/// Acknowledgement for recovery enable requests.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryEnableAck {
+    /// Original frontend transaction ID.
+    pub client_txn_id: String,
+    /// Generated recovery key/passphrase on success.
+    pub recovery_key: Option<String>,
+    /// Stable backend error code on failure.
+    pub error_code: Option<String>,
+}
+
+/// Acknowledgement for recovery restore requests.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecoveryRestoreAck {
+    /// Original frontend transaction ID.
+    pub client_txn_id: String,
+    /// Stable backend error code on failure.
+    pub error_code: Option<String>,
+}
+
 /// E2EE/trust status summary intended for future frontend consumption.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CryptoStatus {
@@ -286,6 +388,12 @@ pub enum BackendEvent {
     MediaUploadAck(MediaUploadAck),
     /// Media download acknowledgement.
     MediaDownloadAck(MediaDownloadAck),
+    /// Recovery/key-backup status snapshot.
+    RecoveryStatus(RecoveryStatus),
+    /// Recovery setup acknowledgement.
+    RecoveryEnableAck(RecoveryEnableAck),
+    /// Recovery restore acknowledgement.
+    RecoveryRestoreAck(RecoveryRestoreAck),
     /// Crypto status update.
     CryptoStatus(CryptoStatus),
     /// Fatal runtime error.

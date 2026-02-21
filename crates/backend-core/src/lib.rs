@@ -26,6 +26,7 @@ pub use state_machine::BackendStateMachine;
 pub use timeline::{TimelineBuffer, TimelineMergeError};
 pub use types::{
     BackendCommand, BackendEvent, BackendInitConfig, BackendLifecycleState, CryptoStatus,
-    MediaDownloadAck, MediaUploadAck, MessageType, RoomSummary, SendAck, SyncStatus, TimelineItem,
-    TimelineOp,
+    KeyBackupState, MediaDownloadAck, MediaUploadAck, MessageType, RecoveryEnableAck,
+    RecoveryRestoreAck, RecoveryState, RecoveryStatus, RoomSummary, SendAck, SyncStatus,
+    TimelineItem, TimelineOp,
 };

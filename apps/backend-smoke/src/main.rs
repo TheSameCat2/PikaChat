@@ -7,6 +7,7 @@ use std::{
 
 use backend_core::{
     BackendCommand, BackendEvent, BackendInitConfig, BackendLifecycleState, EventStream,
+    RecoveryStatus,
 };
 use backend_matrix::{MatrixFrontendAdapter, spawn_runtime};
 use tokio::{sync::broadcast, time::timeout};
@@ -86,7 +87,75 @@ async fn run() -> Result<(), String> {
             println!(
                 "Optional media smoke: PIKACHAT_MEDIA_UPLOAD_FILE, PIKACHAT_MEDIA_CONTENT_TYPE, PIKACHAT_MEDIA_DOWNLOAD_MXC."
             );
+            println!(
+                "Optional recovery smoke: PIKACHAT_GET_RECOVERY_STATUS=1, PIKACHAT_ENABLE_RECOVERY=1, PIKACHAT_RESET_RECOVERY=1, PIKACHAT_RECOVERY_PASSPHRASE, PIKACHAT_WAIT_RECOVERY_UPLOAD=1, PIKACHAT_RECOVERY_KEY."
+            );
             return Ok(());
+        }
+
+        if env_truthy("PIKACHAT_GET_RECOVERY_STATUS") {
+            send_command(&adapter, BackendCommand::GetRecoveryStatus, "GetRecoveryStatus").await?;
+            let status = wait_for_recovery_status(&mut events).await?;
+            println!(
+                "Recovery status: backup_state={:?}, backup_enabled={}, backup_exists_on_server={}, recovery_state={:?}",
+                status.backup_state,
+                status.backup_enabled,
+                status.backup_exists_on_server,
+                status.recovery_state
+            );
+        }
+
+        if env_truthy("PIKACHAT_ENABLE_RECOVERY") {
+            let client_txn_id = format!("smoke-enable-recovery-{}", monotonic_nonce());
+            let passphrase = env::var("PIKACHAT_RECOVERY_PASSPHRASE").ok();
+            let wait_for_backups_to_upload = env_truthy("PIKACHAT_WAIT_RECOVERY_UPLOAD");
+            send_command(
+                &adapter,
+                BackendCommand::EnableRecovery {
+                    client_txn_id: client_txn_id.clone(),
+                    passphrase,
+                    wait_for_backups_to_upload,
+                },
+                "EnableRecovery",
+            )
+            .await?;
+
+            let recovery_key = wait_for_recovery_enable_ack(&mut events, &client_txn_id).await?;
+            println!("Recovery enabled. Recovery key: {recovery_key}");
+        }
+
+        if env_truthy("PIKACHAT_RESET_RECOVERY") {
+            let client_txn_id = format!("smoke-reset-recovery-{}", monotonic_nonce());
+            let passphrase = env::var("PIKACHAT_RECOVERY_PASSPHRASE").ok();
+            let wait_for_backups_to_upload = env_truthy("PIKACHAT_WAIT_RECOVERY_UPLOAD");
+            send_command(
+                &adapter,
+                BackendCommand::ResetRecovery {
+                    client_txn_id: client_txn_id.clone(),
+                    passphrase,
+                    wait_for_backups_to_upload,
+                },
+                "ResetRecovery",
+            )
+            .await?;
+
+            let recovery_key = wait_for_recovery_enable_ack(&mut events, &client_txn_id).await?;
+            println!("Recovery reset complete. New recovery key: {recovery_key}");
+        }
+
+        if let Some(recovery_key) = env::var("PIKACHAT_RECOVERY_KEY").ok() {
+            let client_txn_id = format!("smoke-recover-secrets-{}", monotonic_nonce());
+            send_command(
+                &adapter,
+                BackendCommand::RecoverSecrets {
+                    client_txn_id: client_txn_id.clone(),
+                    recovery_key,
+                },
+                "RecoverSecrets",
+            )
+            .await?;
+            wait_for_recovery_restore_ack(&mut events, &client_txn_id).await?;
+            println!("Recovery restore succeeded.");
         }
 
         send_command(&adapter, BackendCommand::ListRooms, "ListRooms").await?;
@@ -365,6 +434,62 @@ async fn wait_for_media_download_ack(
                 Some(Err(format!(
                     "media download failed with error code: {code}"
                 )))
+            }
+        }
+        BackendEvent::FatalError { code, message, .. } => {
+            Some(Err(format!("fatal backend error ({code}): {message}")))
+        }
+        _ => None,
+    })
+    .await
+}
+
+async fn wait_for_recovery_status(events: &mut EventStream) -> Result<RecoveryStatus, String> {
+    wait_for_event(events, "recovery status", |event| match event {
+        BackendEvent::RecoveryStatus(status) => Some(Ok(status)),
+        BackendEvent::FatalError { code, message, .. } => {
+            Some(Err(format!("fatal backend error ({code}): {message}")))
+        }
+        _ => None,
+    })
+    .await
+}
+
+async fn wait_for_recovery_enable_ack(
+    events: &mut EventStream,
+    client_txn_id: &str,
+) -> Result<String, String> {
+    wait_for_event(events, "recovery enable ack", |event| match event {
+        BackendEvent::RecoveryEnableAck(ack) if ack.client_txn_id == client_txn_id => {
+            if let Some(recovery_key) = ack.recovery_key {
+                Some(Ok(recovery_key))
+            } else {
+                let code = ack.error_code.unwrap_or_else(|| "unknown".to_owned());
+                Some(Err(format!(
+                    "recovery enable failed with error code: {code}"
+                )))
+            }
+        }
+        BackendEvent::FatalError { code, message, .. } => {
+            Some(Err(format!("fatal backend error ({code}): {message}")))
+        }
+        _ => None,
+    })
+    .await
+}
+
+async fn wait_for_recovery_restore_ack(
+    events: &mut EventStream,
+    client_txn_id: &str,
+) -> Result<(), String> {
+    wait_for_event(events, "recovery restore ack", |event| match event {
+        BackendEvent::RecoveryRestoreAck(ack) if ack.client_txn_id == client_txn_id => {
+            if let Some(code) = ack.error_code {
+                Some(Err(format!(
+                    "recovery restore failed with error code: {code}"
+                )))
+            } else {
+                Some(Ok(()))
             }
         }
         BackendEvent::FatalError { code, message, .. } => {

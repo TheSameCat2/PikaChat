@@ -8,6 +8,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use arboard::Clipboard;
 use backend_core::{BackendCommand, BackendEvent, MessageType};
 use backend_matrix::MatrixFrontendAdapter;
 use tokio::sync::{broadcast, mpsc};
@@ -25,6 +26,7 @@ pub type UiUpdateCallback = Arc<dyn Fn(DesktopSnapshot) + Send + Sync + 'static>
 pub struct DesktopBridge {
     command_tx: mpsc::UnboundedSender<BackendCommand>,
     state: Arc<Mutex<DesktopState>>,
+    clipboard: Mutex<Option<Clipboard>>,
     ui_update: UiUpdateCallback,
     next_txn_id: AtomicU64,
     paginate_limit: u16,
@@ -134,6 +136,7 @@ impl DesktopBridge {
         let bridge = Arc::new(Self {
             command_tx,
             state,
+            clipboard: Mutex::new(None),
             ui_update,
             next_txn_id: AtomicU64::new(1),
             paginate_limit: config.paginate_limit.max(1),
@@ -247,6 +250,158 @@ impl DesktopBridge {
         }
     }
 
+    /// Request and display current identity-backup status.
+    pub fn request_recovery_status(&self) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("desktop state lock poisoned while requesting recovery status");
+            state.show_security_status_dialog("Checking backup status...");
+            let snapshot = state.snapshot();
+            (self.ui_update)(snapshot);
+        }
+        self.enqueue_command(get_recovery_status_command());
+    }
+
+    /// Enable identity backup and display generated recovery key.
+    pub fn backup_identity(&self) {
+        let client_txn_id = format!(
+            "desktop-recovery-enable-{}",
+            self.next_txn_id.fetch_add(1, Ordering::Relaxed)
+        );
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("desktop state lock poisoned while enabling identity backup");
+            state.show_security_creating_dialog("Creating backup and generating recovery key...");
+            let snapshot = state.snapshot();
+            (self.ui_update)(snapshot);
+        }
+        self.enqueue_command(enable_recovery_command(client_txn_id));
+    }
+
+    /// Reset existing identity backup and generate a new recovery key.
+    pub fn reset_identity_backup(&self) {
+        let client_txn_id = format!(
+            "desktop-recovery-reset-{}",
+            self.next_txn_id.fetch_add(1, Ordering::Relaxed)
+        );
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("desktop state lock poisoned while resetting identity backup");
+            state.show_security_creating_dialog(
+                "Resetting identity backup and generating a new recovery key...",
+            );
+            state.clear_error();
+            let snapshot = state.snapshot();
+            (self.ui_update)(snapshot);
+        }
+        self.enqueue_command(reset_recovery_command(client_txn_id));
+    }
+
+    /// Show prompt to restore identity secrets using recovery key/passphrase.
+    pub fn prompt_restore_identity(&self) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("desktop state lock poisoned while prompting identity restore");
+            state.show_security_restore_prompt_dialog(
+                "Identity Restore",
+                "Paste your recovery key or passphrase below, then click Restore.",
+            );
+            state.clear_error();
+            let snapshot = state.snapshot();
+            (self.ui_update)(snapshot);
+        }
+    }
+
+    /// Restore identity secrets using recovery key/passphrase.
+    pub fn restore_identity(&self, recovery_key: String) {
+        let recovery_key = recovery_key.trim().to_owned();
+        if recovery_key.is_empty() {
+            let mut state = self
+                .state
+                .lock()
+                .expect("desktop state lock poisoned while validating identity restore");
+            state.set_error_text("Enter a recovery key before restoring identity.");
+            let snapshot = state.snapshot();
+            (self.ui_update)(snapshot);
+            return;
+        }
+
+        let client_txn_id = format!(
+            "desktop-recovery-restore-{}",
+            self.next_txn_id.fetch_add(1, Ordering::Relaxed)
+        );
+        {
+            let mut state = self
+                .state
+                .lock()
+                .expect("desktop state lock poisoned while restoring identity");
+            if !state.begin_restore_request() {
+                let snapshot = state.snapshot();
+                (self.ui_update)(snapshot);
+                return;
+            }
+            state.clear_error();
+            let snapshot = state.snapshot();
+            (self.ui_update)(snapshot);
+        }
+        self.enqueue_command(recover_secrets_command(client_txn_id, recovery_key));
+    }
+
+    /// Dismiss the in-app security dialog.
+    pub fn dismiss_security_dialog(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("desktop state lock poisoned while dismissing security dialog");
+        state.dismiss_security_dialog();
+        let snapshot = state.snapshot();
+        (self.ui_update)(snapshot);
+    }
+
+    /// Copy the currently displayed recovery key to the system clipboard.
+    pub fn copy_recovery_key(&self) {
+        let Some(recovery_key) = self
+            .state
+            .lock()
+            .expect("desktop state lock poisoned while reading recovery key")
+            .recovery_key_for_copy()
+        else {
+            warn!("copy recovery key requested without recovery key in state");
+            return;
+        };
+
+        match self.copy_to_clipboard(&recovery_key) {
+            Ok(()) => {
+                info!("recovery key copied to clipboard");
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("desktop state lock poisoned while marking copied state");
+                state.mark_recovery_key_copied();
+                let snapshot = state.snapshot();
+                (self.ui_update)(snapshot);
+            }
+            Err(err) => {
+                error!(error = %err, "failed to copy recovery key to clipboard");
+                let mut state = self
+                    .state
+                    .lock()
+                    .expect("desktop state lock poisoned while handling copy failure");
+                state.set_error_text("Failed to copy recovery key to clipboard.");
+                let snapshot = state.snapshot();
+                (self.ui_update)(snapshot);
+            }
+        }
+    }
+
     fn enqueue_command(&self, command: BackendCommand) {
         trace!(command = command_kind(&command), "enqueue_command");
         if self.command_tx.send(command).is_err() {
@@ -259,6 +414,34 @@ impl DesktopBridge {
             (self.ui_update)(snapshot);
             error!("backend command channel closed");
         }
+    }
+
+    fn copy_to_clipboard(&self, text: &str) -> Result<(), String> {
+        let mut clipboard_slot = self
+            .clipboard
+            .lock()
+            .expect("clipboard lock poisoned while copying recovery key");
+
+        if clipboard_slot.is_none() {
+            *clipboard_slot = Some(Clipboard::new().map_err(|err| err.to_string())?);
+        }
+
+        let write_result = clipboard_slot
+            .as_mut()
+            .expect("clipboard slot must be initialized")
+            .set_text(text.to_owned());
+
+        if write_result.is_ok() {
+            return Ok(());
+        }
+
+        // Retry once with a fresh clipboard handle in case the previous backend became stale.
+        *clipboard_slot = Some(Clipboard::new().map_err(|err| err.to_string())?);
+        clipboard_slot
+            .as_mut()
+            .expect("clipboard slot must be initialized")
+            .set_text(text.to_owned())
+            .map_err(|err| err.to_string())
     }
 
     fn publish_snapshot(&self) {
@@ -328,6 +511,33 @@ fn paginate_back_command(room_id: String, limit: u16) -> BackendCommand {
     }
 }
 
+fn get_recovery_status_command() -> BackendCommand {
+    BackendCommand::GetRecoveryStatus
+}
+
+fn enable_recovery_command(client_txn_id: String) -> BackendCommand {
+    BackendCommand::EnableRecovery {
+        client_txn_id,
+        passphrase: None,
+        wait_for_backups_to_upload: true,
+    }
+}
+
+fn reset_recovery_command(client_txn_id: String) -> BackendCommand {
+    BackendCommand::ResetRecovery {
+        client_txn_id,
+        passphrase: None,
+        wait_for_backups_to_upload: true,
+    }
+}
+
+fn recover_secrets_command(client_txn_id: String, recovery_key: String) -> BackendCommand {
+    BackendCommand::RecoverSecrets {
+        client_txn_id,
+        recovery_key,
+    }
+}
+
 async fn recv_event(events: &mut broadcast::Receiver<BackendEvent>) -> Result<BackendEvent, ()> {
     loop {
         match events.recv().await {
@@ -361,6 +571,10 @@ fn command_kind(command: &BackendCommand) -> &'static str {
         BackendCommand::RedactMessage { .. } => "RedactMessage",
         BackendCommand::UploadMedia { .. } => "UploadMedia",
         BackendCommand::DownloadMedia { .. } => "DownloadMedia",
+        BackendCommand::GetRecoveryStatus => "GetRecoveryStatus",
+        BackendCommand::EnableRecovery { .. } => "EnableRecovery",
+        BackendCommand::ResetRecovery { .. } => "ResetRecovery",
+        BackendCommand::RecoverSecrets { .. } => "RecoverSecrets",
         BackendCommand::Logout => "Logout",
     }
 }
@@ -376,6 +590,9 @@ fn event_kind(event: &BackendEvent) -> &'static str {
         BackendEvent::SendAck(_) => "SendAck",
         BackendEvent::MediaUploadAck(_) => "MediaUploadAck",
         BackendEvent::MediaDownloadAck(_) => "MediaDownloadAck",
+        BackendEvent::RecoveryStatus(_) => "RecoveryStatus",
+        BackendEvent::RecoveryEnableAck(_) => "RecoveryEnableAck",
+        BackendEvent::RecoveryRestoreAck(_) => "RecoveryRestoreAck",
         BackendEvent::CryptoStatus(_) => "CryptoStatus",
         BackendEvent::FatalError { .. } => "FatalError",
     }
@@ -461,6 +678,38 @@ mod tests {
         assert!(matches!(
             paginate,
             BackendCommand::PaginateBack { room_id, limit } if room_id == "!room:example.org" && limit == 1
+        ));
+
+        let recovery_status = get_recovery_status_command();
+        assert!(matches!(recovery_status, BackendCommand::GetRecoveryStatus));
+
+        let enable_recovery = enable_recovery_command("txn-r".to_owned());
+        assert!(matches!(
+            enable_recovery,
+            BackendCommand::EnableRecovery {
+                client_txn_id,
+                passphrase: None,
+                wait_for_backups_to_upload: true
+            } if client_txn_id == "txn-r"
+        ));
+
+        let reset_recovery = reset_recovery_command("txn-r2".to_owned());
+        assert!(matches!(
+            reset_recovery,
+            BackendCommand::ResetRecovery {
+                client_txn_id,
+                passphrase: None,
+                wait_for_backups_to_upload: true
+            } if client_txn_id == "txn-r2"
+        ));
+
+        let recover = recover_secrets_command("txn-restore".to_owned(), "key words".to_owned());
+        assert!(matches!(
+            recover,
+            BackendCommand::RecoverSecrets {
+                client_txn_id,
+                recovery_key,
+            } if client_txn_id == "txn-restore" && recovery_key == "key words"
         ));
     }
 }

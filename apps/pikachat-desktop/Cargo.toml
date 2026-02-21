@@ -7,6 +7,7 @@ rust-version.workspace = true
 build = "build.rs"
 
 [dependencies]
+arboard = "3.6.1"
 backend-core = { path = "../../crates/backend-core" }
 backend-matrix = { path = "../../crates/backend-matrix" }
 slint = { version = "1.15.1", default-features = false, features = ["std", "compat-1-2", "backend-winit", "backend-winit-wayland", "backend-winit-x11", "renderer-femtovg"] }

@@ -67,7 +67,11 @@ impl BackendStateMachine {
             | EditMessage { .. }
             | RedactMessage { .. }
             | UploadMedia { .. }
-            | DownloadMedia { .. } => {
+            | DownloadMedia { .. }
+            | GetRecoveryStatus
+            | EnableRecovery { .. }
+            | ResetRecovery { .. }
+            | RecoverSecrets { .. } => {
                 if self.is_authenticated_context() {
                     Ok(Vec::new())
                 } else {
@@ -245,6 +249,37 @@ mod tests {
                 source: "mxc://example.org/media".into(),
             })
             .expect_err("media download command should fail when not authenticated");
+        assert_eq!(err.code, "invalid_state_transition");
+
+        let err = sm
+            .apply(&BackendCommand::GetRecoveryStatus)
+            .expect_err("recovery status should fail when not authenticated");
+        assert_eq!(err.code, "invalid_state_transition");
+
+        let err = sm
+            .apply(&BackendCommand::EnableRecovery {
+                client_txn_id: "tx-5".into(),
+                passphrase: None,
+                wait_for_backups_to_upload: false,
+            })
+            .expect_err("enable recovery should fail when not authenticated");
+        assert_eq!(err.code, "invalid_state_transition");
+
+        let err = sm
+            .apply(&BackendCommand::RecoverSecrets {
+                client_txn_id: "tx-6".into(),
+                recovery_key: "key".into(),
+            })
+            .expect_err("recover secrets should fail when not authenticated");
+        assert_eq!(err.code, "invalid_state_transition");
+
+        let err = sm
+            .apply(&BackendCommand::ResetRecovery {
+                client_txn_id: "tx-7".into(),
+                passphrase: None,
+                wait_for_backups_to_upload: false,
+            })
+            .expect_err("reset recovery should fail when not authenticated");
         assert_eq!(err.code, "invalid_state_transition");
     }
 }

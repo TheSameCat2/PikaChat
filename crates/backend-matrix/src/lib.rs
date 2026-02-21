@@ -20,9 +20,10 @@ use async_trait::async_trait;
 use backend_core::{
     BackendChannelError, BackendChannels, BackendCommand, BackendError, BackendErrorCategory,
     BackendEvent, BackendInitConfig, BackendLifecycleState, BackendStateMachine, EventStream,
-    MediaDownloadAck, MediaUploadAck, MessageType, RetryPolicy, RoomSummary, SendOutcome,
-    SyncStatus, TimelineBuffer, TimelineItem, TimelineMergeError, TimelineOp, classify_http_status,
-    normalize_send_outcome,
+    KeyBackupState, MediaDownloadAck, MediaUploadAck, MessageType, RecoveryEnableAck,
+    RecoveryRestoreAck, RecoveryState as CoreRecoveryState, RecoveryStatus, RetryPolicy,
+    RoomSummary, SendOutcome, SyncStatus, TimelineBuffer, TimelineItem, TimelineMergeError,
+    TimelineOp, classify_http_status, normalize_send_outcome,
 };
 use backend_platform::{OsKeyringSecretStore, ScopedSecretStore, SecretStoreError};
 use matrix_sdk::{
@@ -31,6 +32,11 @@ use matrix_sdk::{
     config::RequestConfig,
     config::SyncSettings,
     deserialized_responses::TimelineEvent,
+    encryption::{
+        BackupDownloadStrategy, EncryptionSettings,
+        backups::BackupState as MatrixBackupState,
+        recovery::{RecoveryError as MatrixRecoveryError, RecoveryState as MatrixRecoveryState},
+    },
     media::{MediaFormat, MediaRequestParameters},
     room::{Messages, MessagesOptions, edit::EditedContent},
     ruma::{
@@ -71,10 +77,14 @@ const MSGTYPE_TEXT: &str = "m.text";
 const MSGTYPE_NOTICE: &str = "m.notice";
 const MSGTYPE_EMOTE: &str = "m.emote";
 const ENCRYPTED_TIMELINE_PLACEHOLDER: &str = "[Encrypted message: keys unavailable on this device]";
+const TO_DEVICE_ROOM_KEY_EVENT_TYPE: &str = "m.room_key";
+const TO_DEVICE_FORWARDED_ROOM_KEY_EVENT_TYPE: &str = "m.forwarded_room_key";
 const DEFAULT_TIMELINE_MAX_ITEMS: usize = 500;
 const STORE_PASSPHRASE_FILENAME: &str = ".pikachat-store-passphrase";
 const DEVICE_ID_HINT_SUFFIX: &str = ".device-id-hint";
 const LEGACY_DEVICE_ID_HINT_FILENAME: &str = ".pikachat-device-id";
+const ROOM_KEY_REFRESH_ROOM_LIMIT: usize = 5;
+const ROOM_KEY_REFRESH_EVENT_LIMIT: u16 = 30;
 
 /// Configuration for constructing a [`MatrixBackend`] instance.
 #[derive(Debug, Clone)]
@@ -123,6 +133,11 @@ impl MatrixBackend {
     pub async fn new(config: MatrixBackendConfig) -> Result<Self, BackendError> {
         let client = Client::builder()
             .homeserver_url(&config.homeserver)
+            .with_encryption_settings(EncryptionSettings {
+                auto_enable_cross_signing: false,
+                backup_download_strategy: BackupDownloadStrategy::OneShot,
+                auto_enable_backups: false,
+            })
             .sqlite_store(&config.data_dir, config.store_passphrase.as_deref())
             .build()
             .await
@@ -227,6 +242,7 @@ impl MatrixBackend {
 
             let retry_policy = RetryPolicy::default();
             let mut attempt: u32 = 0;
+            let mut room_event_bodies: HashMap<String, HashMap<String, String>> = HashMap::new();
             let mut sync_settings = match sync_request_timeout {
                 Some(timeout) => SyncSettings::default().timeout(timeout),
                 None => SyncSettings::default(),
@@ -239,7 +255,8 @@ impl MatrixBackend {
                         match sync_result {
                             Ok(sync_response) => {
                                 attempt = 0;
-                                let deltas = sync_timeline_deltas(&sync_response);
+                                let deltas =
+                                    sync_timeline_deltas(&sync_response, &mut room_event_bodies);
                                 trace!(room_delta_count = deltas.len(), "sync response processed");
                                 for (room_id, ops) in deltas {
                                     debug!(
@@ -252,10 +269,31 @@ impl MatrixBackend {
                                         ops,
                                     });
                                 }
-                                sync_settings = sync_settings.token(sync_response.next_batch);
                                 let rooms = collect_room_summaries(&client);
                                 debug!(room_count = rooms.len(), "emitting room list after sync");
                                 let _ = event_tx_clone.send(BackendEvent::RoomListUpdated { rooms });
+
+                                if sync_response_has_room_key_events(&sync_response) {
+                                    let refresh_deltas = refresh_room_timeline_updates_after_room_keys(
+                                        &client,
+                                        &mut room_event_bodies,
+                                    )
+                                    .await;
+                                    for (room_id, ops) in refresh_deltas {
+                                        debug!(
+                                            room_id = %room_id,
+                                            op_count = ops.len(),
+                                            "emitting timeline refresh delta after room-key to-device event"
+                                        );
+                                        let _ = event_tx_clone.send(BackendEvent::RoomTimelineDelta {
+                                            room_id,
+                                            ops,
+                                        });
+                                    }
+                                }
+
+                                sync_settings = sync_settings.token(sync_response.next_batch);
+
                                 let _ = event_tx_clone.send(BackendEvent::SyncStatus(SyncStatus {
                                     running: true,
                                     lag_hint_ms: None,
@@ -485,6 +523,105 @@ impl MatrixBackend {
             .map_err(map_matrix_error)
     }
 
+    /// Fetch current backup/recovery status from local state and homeserver.
+    pub async fn get_recovery_status(&self) -> Result<RecoveryStatus, BackendError> {
+        let backups = self.client.encryption().backups();
+        let backup_state = map_backup_state(backups.state());
+        let backup_enabled = backups.are_enabled().await;
+        let backup_exists_on_server = backups
+            .fetch_exists_on_server()
+            .await
+            .map_err(map_matrix_error)?;
+        let recovery_state = map_recovery_state(self.client.encryption().recovery().state());
+
+        Ok(RecoveryStatus {
+            backup_state,
+            backup_enabled,
+            backup_exists_on_server,
+            recovery_state,
+        })
+    }
+
+    /// Enable recovery and backups, returning the generated recovery key.
+    pub async fn enable_recovery(
+        &self,
+        passphrase: Option<&str>,
+        wait_for_backups_to_upload: bool,
+    ) -> Result<String, BackendError> {
+        let existing = self.get_recovery_status().await?;
+        if existing.backup_enabled
+            && existing.backup_exists_on_server
+            && matches!(
+                existing.recovery_state,
+                CoreRecoveryState::Enabled | CoreRecoveryState::Incomplete
+            )
+        {
+            return Err(BackendError::new(
+                BackendErrorCategory::Config,
+                "recovery_already_enabled",
+                "identity backup is already enabled; use status view to inspect current backup",
+            ));
+        }
+
+        let recovery = self.client.encryption().recovery();
+        let enable = recovery.enable();
+        let enable = if wait_for_backups_to_upload {
+            enable.wait_for_backups_to_upload()
+        } else {
+            enable
+        };
+
+        let recovery_key = if let Some(passphrase) = passphrase {
+            enable.with_passphrase(passphrase).await
+        } else {
+            enable.await
+        }
+        .map_err(map_recovery_error)?;
+
+        Ok(recovery_key)
+    }
+
+    /// Recover secrets from secret storage using a recovery key/passphrase.
+    pub async fn recover_secrets(&self, recovery_key: &str) -> Result<(), BackendError> {
+        self.client
+            .encryption()
+            .recovery()
+            .recover(recovery_key)
+            .await
+            .map_err(map_recovery_error)
+    }
+
+    /// Reset backup/recovery setup and return a newly generated recovery key.
+    pub async fn reset_recovery(
+        &self,
+        passphrase: Option<&str>,
+        wait_for_backups_to_upload: bool,
+    ) -> Result<String, BackendError> {
+        self.client
+            .encryption()
+            .backups()
+            .disable_and_delete()
+            .await
+            .map_err(map_matrix_error)?;
+
+        let recovery = self.client.encryption().recovery();
+        let enable = recovery.enable();
+        let enable = if wait_for_backups_to_upload {
+            enable.wait_for_backups_to_upload()
+        } else {
+            enable
+        };
+
+        let recovery_key = if let Some(passphrase) = passphrase {
+            enable.with_passphrase(passphrase).await
+        } else {
+            enable.await
+        }
+        .map_err(map_recovery_error)?;
+
+        Ok(recovery_key)
+    }
+
     fn lookup_room(&self, room_id: &str) -> Result<matrix_sdk::Room, BackendError> {
         let room_id = parse_room_id(room_id)?;
         self.client.get_room(&room_id).ok_or_else(|| {
@@ -549,6 +686,18 @@ trait RuntimeBackend: Send + Sync {
     async fn upload_media(&self, content_type: &str, data: Vec<u8>)
     -> Result<String, BackendError>;
     async fn download_media(&self, source: &str) -> Result<Vec<u8>, BackendError>;
+    async fn get_recovery_status(&self) -> Result<RecoveryStatus, BackendError>;
+    async fn enable_recovery(
+        &self,
+        passphrase: Option<&str>,
+        wait_for_backups_to_upload: bool,
+    ) -> Result<String, BackendError>;
+    async fn reset_recovery(
+        &self,
+        passphrase: Option<&str>,
+        wait_for_backups_to_upload: bool,
+    ) -> Result<String, BackendError>;
+    async fn recover_secrets(&self, recovery_key: &str) -> Result<(), BackendError>;
 }
 
 #[async_trait]
@@ -656,6 +805,30 @@ impl RuntimeBackend for MatrixBackend {
 
     async fn download_media(&self, source: &str) -> Result<Vec<u8>, BackendError> {
         MatrixBackend::download_media(self, source).await
+    }
+
+    async fn get_recovery_status(&self) -> Result<RecoveryStatus, BackendError> {
+        MatrixBackend::get_recovery_status(self).await
+    }
+
+    async fn enable_recovery(
+        &self,
+        passphrase: Option<&str>,
+        wait_for_backups_to_upload: bool,
+    ) -> Result<String, BackendError> {
+        MatrixBackend::enable_recovery(self, passphrase, wait_for_backups_to_upload).await
+    }
+
+    async fn reset_recovery(
+        &self,
+        passphrase: Option<&str>,
+        wait_for_backups_to_upload: bool,
+    ) -> Result<String, BackendError> {
+        MatrixBackend::reset_recovery(self, passphrase, wait_for_backups_to_upload).await
+    }
+
+    async fn recover_secrets(&self, recovery_key: &str) -> Result<(), BackendError> {
+        MatrixBackend::recover_secrets(self, recovery_key).await
     }
 }
 
@@ -1114,6 +1287,33 @@ impl MatrixRuntime {
                 source,
             } => {
                 self.handle_download_media(client_txn_id, source).await;
+                Ok(())
+            }
+            BackendCommand::GetRecoveryStatus => self.handle_get_recovery_status().await,
+            BackendCommand::EnableRecovery {
+                client_txn_id,
+                passphrase,
+                wait_for_backups_to_upload,
+            } => {
+                self.handle_enable_recovery(client_txn_id, passphrase, wait_for_backups_to_upload)
+                    .await;
+                Ok(())
+            }
+            BackendCommand::ResetRecovery {
+                client_txn_id,
+                passphrase,
+                wait_for_backups_to_upload,
+            } => {
+                self.handle_reset_recovery(client_txn_id, passphrase, wait_for_backups_to_upload)
+                    .await;
+                Ok(())
+            }
+            BackendCommand::RecoverSecrets {
+                client_txn_id,
+                recovery_key,
+            } => {
+                self.handle_recover_secrets(client_txn_id, recovery_key)
+                    .await;
                 Ok(())
             }
             BackendCommand::Logout => self.handle_logout().await,
@@ -1972,6 +2172,217 @@ impl MatrixRuntime {
         }
     }
 
+    async fn handle_get_recovery_status(&mut self) -> Result<(), BackendError> {
+        debug!("handling GetRecoveryStatus command");
+        let (_candidate, _events) = self.validate_transition(BackendCommand::GetRecoveryStatus)?;
+        let backend = self.require_backend()?;
+        let status = backend.get_recovery_status().await?;
+        self.channels.emit(BackendEvent::RecoveryStatus(status));
+        Ok(())
+    }
+
+    async fn handle_enable_recovery(
+        &mut self,
+        client_txn_id: String,
+        passphrase: Option<String>,
+        wait_for_backups_to_upload: bool,
+    ) {
+        debug!(
+            client_txn_id = %client_txn_id,
+            has_passphrase = passphrase.is_some(),
+            wait_for_backups_to_upload,
+            "handling EnableRecovery command"
+        );
+        let validation = self.validate_transition(BackendCommand::EnableRecovery {
+            client_txn_id: String::new(),
+            passphrase: None,
+            wait_for_backups_to_upload,
+        });
+
+        if let Err(err) = validation {
+            self.channels
+                .emit(BackendEvent::RecoveryEnableAck(RecoveryEnableAck {
+                    client_txn_id,
+                    recovery_key: None,
+                    error_code: Some(err.code),
+                }));
+            return;
+        }
+
+        let backend = match self.require_backend() {
+            Ok(backend) => backend,
+            Err(err) => {
+                self.channels
+                    .emit(BackendEvent::RecoveryEnableAck(RecoveryEnableAck {
+                        client_txn_id,
+                        recovery_key: None,
+                        error_code: Some(err.code),
+                    }));
+                return;
+            }
+        };
+
+        match backend
+            .enable_recovery(passphrase.as_deref(), wait_for_backups_to_upload)
+            .await
+        {
+            Ok(recovery_key) => {
+                self.channels
+                    .emit(BackendEvent::RecoveryEnableAck(RecoveryEnableAck {
+                        client_txn_id: client_txn_id.clone(),
+                        recovery_key: Some(recovery_key),
+                        error_code: None,
+                    }));
+                match backend.get_recovery_status().await {
+                    Ok(status) => self.channels.emit(BackendEvent::RecoveryStatus(status)),
+                    Err(err) => warn!(
+                        code = %err.code,
+                        message = %err.message,
+                        "failed to fetch recovery status after enable"
+                    ),
+                }
+            }
+            Err(err) => {
+                self.channels
+                    .emit(BackendEvent::RecoveryEnableAck(RecoveryEnableAck {
+                        client_txn_id,
+                        recovery_key: None,
+                        error_code: Some(err.code),
+                    }));
+            }
+        }
+    }
+
+    async fn handle_recover_secrets(&mut self, client_txn_id: String, recovery_key: String) {
+        debug!(
+            client_txn_id = %client_txn_id,
+            recovery_key_len = recovery_key.len(),
+            "handling RecoverSecrets command"
+        );
+        let validation = self.validate_transition(BackendCommand::RecoverSecrets {
+            client_txn_id: String::new(),
+            recovery_key: String::new(),
+        });
+
+        if let Err(err) = validation {
+            self.channels
+                .emit(BackendEvent::RecoveryRestoreAck(RecoveryRestoreAck {
+                    client_txn_id,
+                    error_code: Some(err.code),
+                }));
+            return;
+        }
+
+        let backend = match self.require_backend() {
+            Ok(backend) => backend,
+            Err(err) => {
+                self.channels
+                    .emit(BackendEvent::RecoveryRestoreAck(RecoveryRestoreAck {
+                        client_txn_id,
+                        error_code: Some(err.code),
+                    }));
+                return;
+            }
+        };
+
+        match backend.recover_secrets(&recovery_key).await {
+            Ok(()) => {
+                self.channels
+                    .emit(BackendEvent::RecoveryRestoreAck(RecoveryRestoreAck {
+                        client_txn_id: client_txn_id.clone(),
+                        error_code: None,
+                    }));
+                match backend.get_recovery_status().await {
+                    Ok(status) => self.channels.emit(BackendEvent::RecoveryStatus(status)),
+                    Err(err) => warn!(
+                        code = %err.code,
+                        message = %err.message,
+                        "failed to fetch recovery status after recover"
+                    ),
+                }
+            }
+            Err(err) => {
+                self.channels
+                    .emit(BackendEvent::RecoveryRestoreAck(RecoveryRestoreAck {
+                        client_txn_id,
+                        error_code: Some(err.code),
+                    }));
+            }
+        }
+    }
+
+    async fn handle_reset_recovery(
+        &mut self,
+        client_txn_id: String,
+        passphrase: Option<String>,
+        wait_for_backups_to_upload: bool,
+    ) {
+        debug!(
+            client_txn_id = %client_txn_id,
+            has_passphrase = passphrase.is_some(),
+            wait_for_backups_to_upload,
+            "handling ResetRecovery command"
+        );
+        let validation = self.validate_transition(BackendCommand::ResetRecovery {
+            client_txn_id: String::new(),
+            passphrase: None,
+            wait_for_backups_to_upload,
+        });
+
+        if let Err(err) = validation {
+            self.channels
+                .emit(BackendEvent::RecoveryEnableAck(RecoveryEnableAck {
+                    client_txn_id,
+                    recovery_key: None,
+                    error_code: Some(err.code),
+                }));
+            return;
+        }
+
+        let backend = match self.require_backend() {
+            Ok(backend) => backend,
+            Err(err) => {
+                self.channels
+                    .emit(BackendEvent::RecoveryEnableAck(RecoveryEnableAck {
+                        client_txn_id,
+                        recovery_key: None,
+                        error_code: Some(err.code),
+                    }));
+                return;
+            }
+        };
+
+        match backend
+            .reset_recovery(passphrase.as_deref(), wait_for_backups_to_upload)
+            .await
+        {
+            Ok(recovery_key) => {
+                self.channels
+                    .emit(BackendEvent::RecoveryEnableAck(RecoveryEnableAck {
+                        client_txn_id: client_txn_id.clone(),
+                        recovery_key: Some(recovery_key),
+                        error_code: None,
+                    }));
+                match backend.get_recovery_status().await {
+                    Ok(status) => self.channels.emit(BackendEvent::RecoveryStatus(status)),
+                    Err(err) => warn!(
+                        code = %err.code,
+                        message = %err.message,
+                        "failed to fetch recovery status after reset"
+                    ),
+                }
+            }
+            Err(err) => {
+                self.channels
+                    .emit(BackendEvent::RecoveryEnableAck(RecoveryEnableAck {
+                        client_txn_id,
+                        recovery_key: None,
+                        error_code: Some(err.code),
+                    }));
+            }
+        }
+    }
+
     async fn handle_logout(&mut self) -> Result<(), BackendError> {
         let (candidate, transition_events) = self.validate_transition(BackendCommand::Logout)?;
         let backend = self.require_backend()?;
@@ -2165,6 +2576,10 @@ fn command_kind(command: &BackendCommand) -> &'static str {
         BackendCommand::RedactMessage { .. } => "RedactMessage",
         BackendCommand::UploadMedia { .. } => "UploadMedia",
         BackendCommand::DownloadMedia { .. } => "DownloadMedia",
+        BackendCommand::GetRecoveryStatus => "GetRecoveryStatus",
+        BackendCommand::EnableRecovery { .. } => "EnableRecovery",
+        BackendCommand::ResetRecovery { .. } => "ResetRecovery",
+        BackendCommand::RecoverSecrets { .. } => "RecoverSecrets",
         BackendCommand::Logout => "Logout",
     }
 }
@@ -2448,14 +2863,46 @@ fn timeline_ops_for_pagination(messages: Messages) -> Vec<TimelineOp> {
     ops
 }
 
-fn timeline_ops_for_sync_events(events: &[TimelineEvent], limited: bool) -> Vec<TimelineOp> {
+fn timeline_ops_for_sync_events(
+    events: &[TimelineEvent],
+    limited: bool,
+    known_event_bodies: &mut HashMap<String, String>,
+) -> Vec<TimelineOp> {
     let mut ops = Vec::new();
     if limited {
         ops.push(TimelineOp::Clear);
+        known_event_bodies.clear();
     }
     for event in events {
         if let Some(op) = timeline_op_from_event(event, TimelineInsertMode::Append) {
-            ops.push(op);
+            match op {
+                TimelineOp::Append(item) => {
+                    if let Some(event_id) = item.event_id.as_ref() {
+                        if let Some(existing_body) = known_event_bodies.get(event_id) {
+                            if existing_body == &item.body {
+                                continue;
+                            }
+                            known_event_bodies.insert(event_id.clone(), item.body.clone());
+                            ops.push(TimelineOp::UpdateBody {
+                                event_id: event_id.clone(),
+                                new_body: item.body,
+                            });
+                            continue;
+                        }
+                        known_event_bodies.insert(event_id.clone(), item.body.clone());
+                    }
+                    ops.push(TimelineOp::Append(item));
+                }
+                TimelineOp::UpdateBody { event_id, new_body } => {
+                    known_event_bodies.insert(event_id.clone(), new_body.clone());
+                    ops.push(TimelineOp::UpdateBody { event_id, new_body });
+                }
+                TimelineOp::Remove { event_id } => {
+                    known_event_bodies.remove(&event_id);
+                    ops.push(TimelineOp::Remove { event_id });
+                }
+                other => ops.push(other),
+            }
         }
     }
     ops
@@ -2531,17 +2978,147 @@ fn event_type(event: &TimelineEvent) -> Option<String> {
 
 fn sync_timeline_deltas(
     sync_response: &matrix_sdk::sync::SyncResponse,
+    room_event_bodies: &mut HashMap<String, HashMap<String, String>>,
 ) -> Vec<(String, Vec<TimelineOp>)> {
     let mut deltas = Vec::new();
 
     for (room_id, update) in &sync_response.rooms.joined {
-        let ops = timeline_ops_for_sync_events(&update.timeline.events, update.timeline.limited);
+        let room_id = room_id.to_string();
+        let known_event_bodies = room_event_bodies.entry(room_id.clone()).or_default();
+        let ops = timeline_ops_for_sync_events(
+            &update.timeline.events,
+            update.timeline.limited,
+            known_event_bodies,
+        );
         if !ops.is_empty() {
-            deltas.push((room_id.to_string(), ops));
+            deltas.push((room_id, ops));
         }
     }
 
     deltas
+}
+
+fn sync_response_has_room_key_events(sync_response: &matrix_sdk::sync::SyncResponse) -> bool {
+    sync_response.to_device.iter().any(|event| {
+        matches!(
+            event
+                .as_raw()
+                .get_field::<String>("type")
+                .ok()
+                .flatten()
+                .as_deref(),
+            Some(TO_DEVICE_ROOM_KEY_EVENT_TYPE | TO_DEVICE_FORWARDED_ROOM_KEY_EVENT_TYPE)
+        )
+    })
+}
+
+async fn refresh_room_timeline_updates_after_room_keys(
+    client: &Client,
+    room_event_bodies: &mut HashMap<String, HashMap<String, String>>,
+) -> Vec<(String, Vec<TimelineOp>)> {
+    let candidate_room_ids: Vec<String> = room_event_bodies
+        .iter()
+        .filter(|(_, known_event_bodies)| !known_event_bodies.is_empty())
+        .map(|(room_id, _)| room_id.clone())
+        .take(ROOM_KEY_REFRESH_ROOM_LIMIT)
+        .collect();
+
+    let mut deltas = Vec::new();
+    for room_id in candidate_room_ids {
+        let Ok(parsed_room_id) = parse_room_id(&room_id) else {
+            continue;
+        };
+        let Some(room) = client.get_room(parsed_room_id.as_ref()) else {
+            continue;
+        };
+
+        let options = match messages_options(None, ROOM_KEY_REFRESH_EVENT_LIMIT) {
+            Ok(options) => options,
+            Err(err) => {
+                warn!(
+                    code = %err.code,
+                    message = %err.message,
+                    room_id = %room_id,
+                    "unable to build room-key refresh pagination options"
+                );
+                continue;
+            }
+        };
+
+        let messages = match room.messages(options).await {
+            Ok(messages) => messages,
+            Err(err) => {
+                let mapped = map_matrix_error(err);
+                debug!(
+                    code = %mapped.code,
+                    message = %mapped.message,
+                    room_id = %room_id,
+                    "room-key refresh fetch failed"
+                );
+                continue;
+            }
+        };
+
+        let Some(known_event_bodies) = room_event_bodies.get_mut(&room_id) else {
+            continue;
+        };
+        let ops = timeline_update_ops_for_refresh_events(&messages.chunk, known_event_bodies);
+        if !ops.is_empty() {
+            deltas.push((room_id, ops));
+        }
+    }
+
+    deltas
+}
+
+fn timeline_update_ops_for_refresh_events(
+    events: &[TimelineEvent],
+    known_event_bodies: &mut HashMap<String, String>,
+) -> Vec<TimelineOp> {
+    let mut ops = Vec::new();
+
+    for event in events {
+        let Some(op) = timeline_op_from_event(event, TimelineInsertMode::Append) else {
+            continue;
+        };
+
+        match op {
+            TimelineOp::Append(item) => {
+                let Some(event_id) = item.event_id else {
+                    continue;
+                };
+                let Some(existing_body) = known_event_bodies.get(&event_id) else {
+                    continue;
+                };
+                if existing_body == &item.body {
+                    continue;
+                }
+                known_event_bodies.insert(event_id.clone(), item.body.clone());
+                ops.push(TimelineOp::UpdateBody {
+                    event_id,
+                    new_body: item.body,
+                });
+            }
+            TimelineOp::UpdateBody { event_id, new_body } => {
+                let Some(existing_body) = known_event_bodies.get(&event_id) else {
+                    continue;
+                };
+                if existing_body == &new_body {
+                    continue;
+                }
+                known_event_bodies.insert(event_id.clone(), new_body.clone());
+                ops.push(TimelineOp::UpdateBody { event_id, new_body });
+            }
+            TimelineOp::Remove { event_id } => {
+                if known_event_bodies.remove(&event_id).is_some() {
+                    ops.push(TimelineOp::Remove { event_id });
+                }
+            }
+            TimelineOp::Prepend(_) | TimelineOp::Clear => {}
+        }
+    }
+
+    ops
 }
 
 fn timeline_item_from_event(
@@ -2639,6 +3216,27 @@ fn collect_room_summaries(client: &Client) -> Vec<RoomSummary> {
     rooms
 }
 
+fn map_backup_state(state: MatrixBackupState) -> KeyBackupState {
+    match state {
+        MatrixBackupState::Unknown => KeyBackupState::Unknown,
+        MatrixBackupState::Creating => KeyBackupState::Creating,
+        MatrixBackupState::Enabling => KeyBackupState::Enabling,
+        MatrixBackupState::Resuming => KeyBackupState::Resuming,
+        MatrixBackupState::Enabled => KeyBackupState::Enabled,
+        MatrixBackupState::Downloading => KeyBackupState::Downloading,
+        MatrixBackupState::Disabling => KeyBackupState::Disabling,
+    }
+}
+
+fn map_recovery_state(state: MatrixRecoveryState) -> CoreRecoveryState {
+    match state {
+        MatrixRecoveryState::Unknown => CoreRecoveryState::Unknown,
+        MatrixRecoveryState::Enabled => CoreRecoveryState::Enabled,
+        MatrixRecoveryState::Disabled => CoreRecoveryState::Disabled,
+        MatrixRecoveryState::Incomplete => CoreRecoveryState::Incomplete,
+    }
+}
+
 fn is_recoverable_sync_error(err: &BackendError) -> bool {
     matches!(
         err.category,
@@ -2710,6 +3308,22 @@ fn map_edit_error(err: matrix_sdk::room::edit::EditError) -> BackendError {
         EditError::Fetch(_) => BackendError::new(
             BackendErrorCategory::Network,
             "edit_fetch_error",
+            err.to_string(),
+        ),
+    }
+}
+
+fn map_recovery_error(err: MatrixRecoveryError) -> BackendError {
+    match err {
+        MatrixRecoveryError::BackupExistsOnServer => BackendError::new(
+            BackendErrorCategory::Config,
+            "recovery_backup_exists",
+            "a backup already exists on the homeserver",
+        ),
+        MatrixRecoveryError::Sdk(err) => map_matrix_error(err),
+        MatrixRecoveryError::SecretStorage(err) => BackendError::new(
+            BackendErrorCategory::Crypto,
+            "secret_storage_error",
             err.to_string(),
         ),
     }
@@ -2947,6 +3561,9 @@ mod tests {
         start_sync_timeouts: Mutex<Vec<Option<Duration>>>,
         open_room_limits: Mutex<Vec<u16>>,
         paginate_back_limits: Mutex<Vec<u16>>,
+        enable_recovery_inputs: Mutex<Vec<(Option<String>, bool)>>,
+        reset_recovery_inputs: Mutex<Vec<(Option<String>, bool)>>,
+        recover_secret_inputs: Mutex<Vec<String>>,
         rooms: Vec<RoomSummary>,
         login_result: Result<(), BackendError>,
         login_delay: Option<Duration>,
@@ -2956,6 +3573,10 @@ mod tests {
         send_message_result: Result<String, BackendError>,
         upload_media_result: Result<String, BackendError>,
         download_media_result: Result<Vec<u8>, BackendError>,
+        recovery_status_result: Result<RecoveryStatus, BackendError>,
+        enable_recovery_result: Result<String, BackendError>,
+        reset_recovery_result: Result<String, BackendError>,
+        recover_secrets_result: Result<(), BackendError>,
         session: Option<MatrixSession>,
     }
 
@@ -2967,6 +3588,9 @@ mod tests {
                 start_sync_timeouts: Mutex::new(Vec::new()),
                 open_room_limits: Mutex::new(Vec::new()),
                 paginate_back_limits: Mutex::new(Vec::new()),
+                enable_recovery_inputs: Mutex::new(Vec::new()),
+                reset_recovery_inputs: Mutex::new(Vec::new()),
+                recover_secret_inputs: Mutex::new(Vec::new()),
                 rooms,
                 login_result: Ok(()),
                 login_delay: None,
@@ -2976,6 +3600,15 @@ mod tests {
                 send_message_result: Ok("$mock-event:example.org".to_owned()),
                 upload_media_result: Ok("mxc://example.org/mock-media".to_owned()),
                 download_media_result: Ok(b"mock-media".to_vec()),
+                recovery_status_result: Ok(RecoveryStatus {
+                    backup_state: KeyBackupState::Unknown,
+                    backup_enabled: false,
+                    backup_exists_on_server: false,
+                    recovery_state: CoreRecoveryState::Unknown,
+                }),
+                enable_recovery_result: Ok("mock recovery key".to_owned()),
+                reset_recovery_result: Ok("mock reset recovery key".to_owned()),
+                recover_secrets_result: Ok(()),
                 session: Some(mock_session()),
             }
         }
@@ -3016,6 +3649,27 @@ mod tests {
             self.paginate_back_limits
                 .lock()
                 .expect("paginate-back-limits lock")
+                .clone()
+        }
+
+        fn enable_recovery_inputs_snapshot(&self) -> Vec<(Option<String>, bool)> {
+            self.enable_recovery_inputs
+                .lock()
+                .expect("enable-recovery-inputs lock")
+                .clone()
+        }
+
+        fn reset_recovery_inputs_snapshot(&self) -> Vec<(Option<String>, bool)> {
+            self.reset_recovery_inputs
+                .lock()
+                .expect("reset-recovery-inputs lock")
+                .clone()
+        }
+
+        fn recover_secret_inputs_snapshot(&self) -> Vec<String> {
+            self.recover_secret_inputs
+                .lock()
+                .expect("recover-secret-inputs lock")
                 .clone()
         }
 
@@ -3068,6 +3722,38 @@ mod tests {
             download_media_result: Result<Vec<u8>, BackendError>,
         ) -> Self {
             self.download_media_result = download_media_result;
+            self
+        }
+
+        fn with_recovery_status_result(
+            mut self,
+            recovery_status_result: Result<RecoveryStatus, BackendError>,
+        ) -> Self {
+            self.recovery_status_result = recovery_status_result;
+            self
+        }
+
+        fn with_enable_recovery_result(
+            mut self,
+            enable_recovery_result: Result<String, BackendError>,
+        ) -> Self {
+            self.enable_recovery_result = enable_recovery_result;
+            self
+        }
+
+        fn with_reset_recovery_result(
+            mut self,
+            reset_recovery_result: Result<String, BackendError>,
+        ) -> Self {
+            self.reset_recovery_result = reset_recovery_result;
+            self
+        }
+
+        fn with_recover_secrets_result(
+            mut self,
+            recover_secrets_result: Result<(), BackendError>,
+        ) -> Self {
+            self.recover_secrets_result = recover_secrets_result;
             self
         }
     }
@@ -3204,6 +3890,52 @@ mod tests {
             self.record_call("download_media");
             self.download_media_result.clone()
         }
+
+        async fn get_recovery_status(&self) -> Result<RecoveryStatus, BackendError> {
+            self.record_call("get_recovery_status");
+            self.recovery_status_result.clone()
+        }
+
+        async fn enable_recovery(
+            &self,
+            passphrase: Option<&str>,
+            wait_for_backups_to_upload: bool,
+        ) -> Result<String, BackendError> {
+            self.record_call("enable_recovery");
+            self.enable_recovery_inputs
+                .lock()
+                .expect("enable-recovery-inputs lock")
+                .push((
+                    passphrase.map(ToOwned::to_owned),
+                    wait_for_backups_to_upload,
+                ));
+            self.enable_recovery_result.clone()
+        }
+
+        async fn recover_secrets(&self, recovery_key: &str) -> Result<(), BackendError> {
+            self.record_call("recover_secrets");
+            self.recover_secret_inputs
+                .lock()
+                .expect("recover-secret-inputs lock")
+                .push(recovery_key.to_owned());
+            self.recover_secrets_result.clone()
+        }
+
+        async fn reset_recovery(
+            &self,
+            passphrase: Option<&str>,
+            wait_for_backups_to_upload: bool,
+        ) -> Result<String, BackendError> {
+            self.record_call("reset_recovery");
+            self.reset_recovery_inputs
+                .lock()
+                .expect("reset-recovery-inputs lock")
+                .push((
+                    passphrase.map(ToOwned::to_owned),
+                    wait_for_backups_to_upload,
+                ));
+            self.reset_recovery_result.clone()
+        }
     }
 
     async fn recv_matching_event<F>(events: &mut EventStream, mut predicate: F) -> BackendEvent
@@ -3257,7 +3989,8 @@ mod tests {
     fn sync_timeline_ops_append_events_in_order() {
         let first = make_sync_timeline_event("$e1:example.org", "@alice:example.org", "first", 1);
         let second = make_sync_timeline_event("$e2:example.org", "@bob:example.org", "second", 2);
-        let ops = timeline_ops_for_sync_events(&[first, second], false);
+        let mut known_event_bodies = HashMap::new();
+        let ops = timeline_ops_for_sync_events(&[first, second], false, &mut known_event_bodies);
 
         assert_eq!(ops.len(), 2);
         match &ops[0] {
@@ -3283,7 +4016,8 @@ mod tests {
     #[test]
     fn sync_timeline_ops_insert_clear_when_limited() {
         let event = make_sync_timeline_event("$e3:example.org", "@alice:example.org", "hello", 3);
-        let ops = timeline_ops_for_sync_events(&[event], true);
+        let mut known_event_bodies = HashMap::new();
+        let ops = timeline_ops_for_sync_events(&[event], true, &mut known_event_bodies);
         assert_eq!(ops.len(), 2);
         assert!(matches!(ops[0], TimelineOp::Clear));
         assert!(matches!(ops[1], TimelineOp::Append(_)));
@@ -3299,7 +4033,8 @@ mod tests {
             4,
         );
 
-        let ops = timeline_ops_for_sync_events(&[edit], false);
+        let mut known_event_bodies = HashMap::new();
+        let ops = timeline_ops_for_sync_events(&[edit], false, &mut known_event_bodies);
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             TimelineOp::UpdateBody { event_id, new_body } => {
@@ -3319,7 +4054,8 @@ mod tests {
             5,
         );
 
-        let ops = timeline_ops_for_sync_events(&[redaction], false);
+        let mut known_event_bodies = HashMap::new();
+        let ops = timeline_ops_for_sync_events(&[redaction], false, &mut known_event_bodies);
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             TimelineOp::Remove { event_id } => {
@@ -3339,7 +4075,8 @@ mod tests {
         );
         let text = make_sync_timeline_event("$e4:example.org", "@bob:example.org", "hello", 8);
 
-        let ops = timeline_ops_for_sync_events(&[membership, text], false);
+        let mut known_event_bodies = HashMap::new();
+        let ops = timeline_ops_for_sync_events(&[membership, text], false, &mut known_event_bodies);
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             TimelineOp::Append(item) => {
@@ -3367,7 +4104,8 @@ mod tests {
             10,
         );
 
-        let ops = timeline_ops_for_sync_events(&[image, notice], false);
+        let mut known_event_bodies = HashMap::new();
+        let ops = timeline_ops_for_sync_events(&[image, notice], false, &mut known_event_bodies);
         assert_eq!(ops.len(), 1);
         match &ops[0] {
             TimelineOp::Append(item) => {
@@ -3383,7 +4121,8 @@ mod tests {
         let encrypted = make_sync_encrypted_event("$enc1:example.org", "@alice:example.org", 11);
         let text = make_sync_timeline_event("$e5:example.org", "@bob:example.org", "hello", 12);
 
-        let ops = timeline_ops_for_sync_events(&[encrypted, text], false);
+        let mut known_event_bodies = HashMap::new();
+        let ops = timeline_ops_for_sync_events(&[encrypted, text], false, &mut known_event_bodies);
         assert_eq!(ops.len(), 2);
         match &ops[0] {
             TimelineOp::Append(item) => {
@@ -3392,6 +4131,99 @@ mod tests {
             }
             other => panic!("unexpected op: {other:?}"),
         }
+    }
+
+    #[test]
+    fn sync_timeline_ops_convert_placeholder_to_update_when_body_changes() {
+        let event_id = "$enc2:example.org";
+        let encrypted = make_sync_encrypted_event(event_id, "@alice:example.org", 11);
+        let decrypted =
+            make_sync_timeline_event(event_id, "@alice:example.org", "decrypted body", 11);
+
+        let mut known_event_bodies = HashMap::new();
+        let first_ops = timeline_ops_for_sync_events(&[encrypted], false, &mut known_event_bodies);
+        assert_eq!(first_ops.len(), 1);
+        assert!(matches!(first_ops[0], TimelineOp::Append(_)));
+
+        let second_ops = timeline_ops_for_sync_events(&[decrypted], false, &mut known_event_bodies);
+        assert_eq!(second_ops.len(), 1);
+        match &second_ops[0] {
+            TimelineOp::UpdateBody { event_id, new_body } => {
+                assert_eq!(event_id, "$enc2:example.org");
+                assert_eq!(new_body, "decrypted body");
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sync_timeline_ops_skip_duplicate_appends_for_same_event_body() {
+        let event = make_sync_timeline_event("$dup1:example.org", "@alice:example.org", "hello", 1);
+        let mut known_event_bodies = HashMap::new();
+
+        let first_ops = timeline_ops_for_sync_events(
+            std::slice::from_ref(&event),
+            false,
+            &mut known_event_bodies,
+        );
+        assert_eq!(first_ops.len(), 1);
+        assert!(matches!(first_ops[0], TimelineOp::Append(_)));
+
+        let second_ops = timeline_ops_for_sync_events(&[event], false, &mut known_event_bodies);
+        assert!(second_ops.is_empty());
+    }
+
+    #[test]
+    fn refresh_updates_only_known_event_bodies() {
+        let mut known_event_bodies = HashMap::from([(
+            "$enc3:example.org".to_owned(),
+            ENCRYPTED_TIMELINE_PLACEHOLDER.to_owned(),
+        )]);
+        let unknown = make_sync_timeline_event("$new:example.org", "@alice:example.org", "new", 1);
+        let decrypted_known =
+            make_sync_timeline_event("$enc3:example.org", "@alice:example.org", "decrypted", 2);
+
+        let ops = timeline_update_ops_for_refresh_events(
+            &[unknown, decrypted_known],
+            &mut known_event_bodies,
+        );
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            TimelineOp::UpdateBody { event_id, new_body } => {
+                assert_eq!(event_id, "$enc3:example.org");
+                assert_eq!(new_body, "decrypted");
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
+        assert_eq!(
+            known_event_bodies
+                .get("$enc3:example.org")
+                .map(String::as_str),
+            Some("decrypted")
+        );
+        assert!(!known_event_bodies.contains_key("$new:example.org"));
+    }
+
+    #[test]
+    fn refresh_emits_remove_when_known_event_is_redacted() {
+        let mut known_event_bodies =
+            HashMap::from([("$target:example.org".to_owned(), "hello".to_owned())]);
+        let redaction = make_sync_redaction_event(
+            "$redact:example.org",
+            "@alice:example.org",
+            "$target:example.org",
+            3,
+        );
+
+        let ops = timeline_update_ops_for_refresh_events(&[redaction], &mut known_event_bodies);
+        assert_eq!(ops.len(), 1);
+        match &ops[0] {
+            TimelineOp::Remove { event_id } => {
+                assert_eq!(event_id, "$target:example.org");
+            }
+            other => panic!("unexpected op: {other:?}"),
+        }
+        assert!(!known_event_bodies.contains_key("$target:example.org"));
     }
 
     #[test]
@@ -4198,6 +5030,280 @@ mod tests {
         })
         .await;
         assert!(matches!(download_ack, BackendEvent::MediaDownloadAck(_)));
+    }
+
+    #[tokio::test]
+    async fn runtime_enable_recovery_outside_authenticated_context_emits_ack_failure() {
+        let mock_backend = Arc::new(MockRuntimeBackend::new(Vec::new()));
+        let handle = spawn_runtime_with_backend(mock_backend);
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::EnableRecovery {
+                client_txn_id: "tx-enable-outside-auth".to_owned(),
+                passphrase: None,
+                wait_for_backups_to_upload: false,
+            })
+            .await
+            .expect("enable recovery should enqueue");
+
+        let ack = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::RecoveryEnableAck(RecoveryEnableAck {
+                    client_txn_id,
+                    recovery_key: None,
+                    error_code: Some(code),
+                }) if client_txn_id == "tx-enable-outside-auth" && code == "invalid_state_transition"
+            )
+        })
+        .await;
+        assert!(matches!(ack, BackendEvent::RecoveryEnableAck(_)));
+    }
+
+    #[tokio::test]
+    async fn runtime_get_recovery_status_and_enable_flow_emit_expected_events() {
+        let status = RecoveryStatus {
+            backup_state: KeyBackupState::Enabled,
+            backup_enabled: true,
+            backup_exists_on_server: true,
+            recovery_state: CoreRecoveryState::Enabled,
+        };
+        let mock_backend = Arc::new(
+            MockRuntimeBackend::new(Vec::new())
+                .with_recovery_status_result(Ok(status.clone()))
+                .with_enable_recovery_result(Ok("word1 word2 word3".to_owned())),
+        );
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: None,
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::LoginPassword {
+                user_id_or_localpart: "@mock:example.org".to_owned(),
+                password: "password".to_owned(),
+            })
+            .await
+            .expect("login should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { success: true, .. })
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::GetRecoveryStatus)
+            .await
+            .expect("status should enqueue");
+        let status_event = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::RecoveryStatus(_))
+        })
+        .await;
+        match status_event {
+            BackendEvent::RecoveryStatus(observed) => {
+                assert_eq!(observed, status);
+            }
+            other => panic!("unexpected status event: {other:?}"),
+        }
+
+        handle
+            .send(BackendCommand::EnableRecovery {
+                client_txn_id: "tx-enable".to_owned(),
+                passphrase: Some("opensesame".to_owned()),
+                wait_for_backups_to_upload: true,
+            })
+            .await
+            .expect("enable should enqueue");
+
+        let ack = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::RecoveryEnableAck(RecoveryEnableAck {
+                    client_txn_id,
+                    recovery_key: Some(key),
+                    error_code: None,
+                }) if client_txn_id == "tx-enable" && key == "word1 word2 word3"
+            )
+        })
+        .await;
+        assert!(matches!(ack, BackendEvent::RecoveryEnableAck(_)));
+
+        assert_eq!(
+            mock_backend.enable_recovery_inputs_snapshot(),
+            vec![(Some("opensesame".to_owned()), true)]
+        );
+        assert_eq!(
+            mock_backend.calls_snapshot(),
+            vec![
+                "login_password",
+                "get_recovery_status",
+                "enable_recovery",
+                "get_recovery_status",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reset_recovery_flow_emits_new_recovery_key_ack() {
+        let status = RecoveryStatus {
+            backup_state: KeyBackupState::Enabled,
+            backup_enabled: true,
+            backup_exists_on_server: true,
+            recovery_state: CoreRecoveryState::Enabled,
+        };
+        let mock_backend = Arc::new(
+            MockRuntimeBackend::new(Vec::new())
+                .with_recovery_status_result(Ok(status))
+                .with_reset_recovery_result(Ok("new reset key".to_owned())),
+        );
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: None,
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::LoginPassword {
+                user_id_or_localpart: "@mock:example.org".to_owned(),
+                password: "password".to_owned(),
+            })
+            .await
+            .expect("login should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { success: true, .. })
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::ResetRecovery {
+                client_txn_id: "tx-reset".to_owned(),
+                passphrase: Some("new-passphrase".to_owned()),
+                wait_for_backups_to_upload: true,
+            })
+            .await
+            .expect("reset should enqueue");
+
+        let ack = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::RecoveryEnableAck(RecoveryEnableAck {
+                    client_txn_id,
+                    recovery_key: Some(key),
+                    error_code: None,
+                }) if client_txn_id == "tx-reset" && key == "new reset key"
+            )
+        })
+        .await;
+        assert!(matches!(ack, BackendEvent::RecoveryEnableAck(_)));
+
+        assert_eq!(
+            mock_backend.reset_recovery_inputs_snapshot(),
+            vec![(Some("new-passphrase".to_owned()), true)]
+        );
+        assert_eq!(
+            mock_backend.calls_snapshot(),
+            vec!["login_password", "reset_recovery", "get_recovery_status",]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_recover_secrets_failure_emits_ack_error_code() {
+        let mock_backend = Arc::new(
+            MockRuntimeBackend::new(Vec::new()).with_recover_secrets_result(Err(
+                BackendError::new(
+                    BackendErrorCategory::Crypto,
+                    "secret_storage_error",
+                    "bad key",
+                ),
+            )),
+        );
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: None,
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::LoginPassword {
+                user_id_or_localpart: "@mock:example.org".to_owned(),
+                password: "password".to_owned(),
+            })
+            .await
+            .expect("login should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { success: true, .. })
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::RecoverSecrets {
+                client_txn_id: "tx-recover".to_owned(),
+                recovery_key: "wrong secret".to_owned(),
+            })
+            .await
+            .expect("recover should enqueue");
+
+        let ack = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::RecoveryRestoreAck(RecoveryRestoreAck {
+                    client_txn_id,
+                    error_code: Some(code),
+                }) if client_txn_id == "tx-recover" && code == "secret_storage_error"
+            )
+        })
+        .await;
+        assert!(matches!(ack, BackendEvent::RecoveryRestoreAck(_)));
+        assert_eq!(
+            mock_backend.recover_secret_inputs_snapshot(),
+            vec!["wrong secret".to_owned()]
+        );
     }
 
     #[tokio::test]

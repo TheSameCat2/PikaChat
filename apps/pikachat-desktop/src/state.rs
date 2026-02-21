@@ -3,13 +3,27 @@
 use std::collections::{HashMap, HashSet};
 
 use backend_core::{
-    BackendEvent, BackendLifecycleState, RoomSummary, SendAck, SyncStatus, TimelineItem, TimelineOp,
+    BackendEvent, BackendLifecycleState, KeyBackupState, RecoveryState, RecoveryStatus,
+    RoomSummary, SendAck, SyncStatus, TimelineItem, TimelineOp,
 };
 use tracing::{debug, trace, warn};
 
 const DEFAULT_STATUS: &str = "Idle";
 const SIDEBAR_MIN_WIDTH_PX: f32 = 220.0;
 const SIDEBAR_MAX_FRACTION: f32 = 0.45;
+const SECURITY_TITLE_STATUS: &str = "Identity Backup Status";
+const SECURITY_TITLE_CREATING: &str = "Creating Identity Backup";
+const SECURITY_TITLE_CREATED: &str = "Identity Backup Created";
+const SECURITY_TITLE_RESTORE: &str = "Identity Restore";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecurityDialogMode {
+    None,
+    Status,
+    Creating,
+    RecoveryKey,
+    Info,
+}
 
 /// Sidebar room row consumed by the Slint UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +53,14 @@ pub struct DesktopSnapshot {
     pub status_text: String,
     pub error_text: Option<String>,
     pub can_send: bool,
+    pub show_security_dialog: bool,
+    pub security_dialog_title: String,
+    pub security_dialog_body: String,
+    pub security_show_copy_button: bool,
+    pub security_copy_button_text: String,
+    pub security_show_restore_input: bool,
+    pub security_restore_button_text: String,
+    pub security_restore_in_flight: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -94,6 +116,16 @@ pub struct DesktopState {
     error_text: Option<String>,
     pending_sends: HashSet<String>,
     pagination: PaginationTracker,
+    show_security_dialog: bool,
+    security_dialog_title: String,
+    security_dialog_body: String,
+    security_show_copy_button: bool,
+    security_copy_button_text: String,
+    security_show_restore_input: bool,
+    security_restore_button_text: String,
+    security_restore_in_flight: bool,
+    security_dialog_mode: SecurityDialogMode,
+    security_recovery_key: Option<String>,
 }
 
 impl DesktopState {
@@ -110,6 +142,16 @@ impl DesktopState {
             error_text: None,
             pending_sends: HashSet::new(),
             pagination: PaginationTracker::default(),
+            show_security_dialog: false,
+            security_dialog_title: String::new(),
+            security_dialog_body: String::new(),
+            security_show_copy_button: false,
+            security_copy_button_text: "Copy Key".to_owned(),
+            security_show_restore_input: false,
+            security_restore_button_text: "Restore".to_owned(),
+            security_restore_in_flight: false,
+            security_dialog_mode: SecurityDialogMode::None,
+            security_recovery_key: None,
         }
     }
 
@@ -122,6 +164,14 @@ impl DesktopState {
             status_text: self.status_text.clone(),
             error_text: self.error_text.clone(),
             can_send: self.selected_room_id.is_some(),
+            show_security_dialog: self.show_security_dialog,
+            security_dialog_title: self.security_dialog_title.clone(),
+            security_dialog_body: self.security_dialog_body.clone(),
+            security_show_copy_button: self.security_show_copy_button,
+            security_copy_button_text: self.security_copy_button_text.clone(),
+            security_show_restore_input: self.security_show_restore_input,
+            security_restore_button_text: self.security_restore_button_text.clone(),
+            security_restore_in_flight: self.security_restore_in_flight,
         }
     }
 
@@ -133,6 +183,111 @@ impl DesktopState {
     /// Clears the top-level error message.
     pub fn clear_error(&mut self) {
         self.error_text = None;
+    }
+
+    /// Show a modal-style security dialog in the UI.
+    pub fn show_security_dialog(&mut self, title: impl Into<String>, body: impl Into<String>) {
+        self.show_security_dialog = true;
+        self.security_dialog_title = title.into();
+        self.security_dialog_body = body.into();
+        self.security_dialog_mode = SecurityDialogMode::Info;
+        self.clear_recovery_key_copy_state();
+        self.clear_restore_input_state();
+    }
+
+    /// Show a status-check dialog.
+    pub fn show_security_status_dialog(&mut self, body: impl Into<String>) {
+        self.show_security_dialog = true;
+        self.security_dialog_title = SECURITY_TITLE_STATUS.to_owned();
+        self.security_dialog_body = body.into();
+        self.security_dialog_mode = SecurityDialogMode::Status;
+        self.clear_recovery_key_copy_state();
+        self.clear_restore_input_state();
+    }
+
+    /// Show a backup creation progress dialog.
+    pub fn show_security_creating_dialog(&mut self, body: impl Into<String>) {
+        self.show_security_dialog = true;
+        self.security_dialog_title = SECURITY_TITLE_CREATING.to_owned();
+        self.security_dialog_body = body.into();
+        self.security_dialog_mode = SecurityDialogMode::Creating;
+        self.clear_recovery_key_copy_state();
+        self.clear_restore_input_state();
+    }
+
+    /// Show restore prompt dialog with input controls visible.
+    pub fn show_security_restore_prompt_dialog(
+        &mut self,
+        title: impl Into<String>,
+        body: impl Into<String>,
+    ) {
+        self.show_security_dialog = true;
+        self.security_dialog_title = title.into();
+        self.security_dialog_body = body.into();
+        self.security_dialog_mode = SecurityDialogMode::Info;
+        self.clear_recovery_key_copy_state();
+        self.security_show_restore_input = true;
+        self.security_restore_button_text = "Restore".to_owned();
+        self.security_restore_in_flight = false;
+    }
+
+    /// Mark restore request as in flight in the dialog.
+    ///
+    /// Returns `true` if restore was transitioned into in-flight mode,
+    /// or `false` if a restore request is already running.
+    pub fn begin_restore_request(&mut self) -> bool {
+        if self.security_restore_in_flight {
+            return false;
+        }
+        self.security_restore_in_flight = true;
+        self.security_restore_button_text = "Restoring...".to_owned();
+        true
+    }
+
+    fn show_security_recovery_key_dialog(&mut self, recovery_key: String) {
+        self.show_security_dialog = true;
+        self.security_dialog_title = SECURITY_TITLE_CREATED.to_owned();
+        self.security_dialog_body = format!(
+            "Store this recovery key safely. It can decrypt your encrypted history on new devices.\n\nRecovery key:\n{}",
+            recovery_key
+        );
+        self.security_recovery_key = Some(recovery_key);
+        self.security_show_copy_button = true;
+        self.security_copy_button_text = "Copy Key".to_owned();
+        self.security_dialog_mode = SecurityDialogMode::RecoveryKey;
+        self.clear_restore_input_state();
+    }
+
+    /// Hide the security dialog in the UI.
+    pub fn dismiss_security_dialog(&mut self) {
+        self.show_security_dialog = false;
+        self.security_dialog_mode = SecurityDialogMode::None;
+        self.clear_recovery_key_copy_state();
+        self.clear_restore_input_state();
+    }
+
+    /// Returns the currently visible recovery key (if one is shown in the dialog).
+    pub fn recovery_key_for_copy(&self) -> Option<String> {
+        self.security_recovery_key.clone()
+    }
+
+    /// Mark the recovery key copy action as successful.
+    pub fn mark_recovery_key_copied(&mut self) {
+        if self.security_recovery_key.is_some() && self.security_show_copy_button {
+            self.security_copy_button_text = "Copied".to_owned();
+        }
+    }
+
+    fn clear_recovery_key_copy_state(&mut self) {
+        self.security_show_copy_button = false;
+        self.security_copy_button_text = "Copy Key".to_owned();
+        self.security_recovery_key = None;
+    }
+
+    fn clear_restore_input_state(&mut self) {
+        self.security_show_restore_input = false;
+        self.security_restore_button_text = "Restore".to_owned();
+        self.security_restore_in_flight = false;
     }
 
     /// Return selected room ID, when present.
@@ -281,6 +436,53 @@ impl DesktopState {
             BackendEvent::SendAck(ack) => {
                 self.handle_send_ack(ack);
             }
+            BackendEvent::RecoveryStatus(status) => {
+                // Avoid replacing freshly shown recovery keys with trailing status events.
+                if matches!(self.security_dialog_mode, SecurityDialogMode::Status) {
+                    self.show_security_status_dialog(format_recovery_status(&status));
+                }
+            }
+            BackendEvent::RecoveryEnableAck(ack) => {
+                if let Some(recovery_key) = ack.recovery_key {
+                    self.show_security_recovery_key_dialog(recovery_key);
+                    self.clear_error();
+                } else if let Some(error_code) = ack.error_code {
+                    if error_code == "recovery_already_enabled" {
+                        self.show_security_dialog(
+                            SECURITY_TITLE_STATUS,
+                            "Identity backup is already enabled on this client. Use \"Check Backup Status\" to inspect current state and existing recovery setup.",
+                        );
+                        self.clear_error();
+                    } else if error_code == "recovery_backup_exists" {
+                        self.show_security_dialog(
+                            SECURITY_TITLE_STATUS,
+                            "A server-side key backup already exists for this account. Use \"Check Backup Status\" to inspect state, then restore secrets with your existing recovery key/passphrase instead of creating a new backup.",
+                        );
+                        self.clear_error();
+                    } else {
+                        self.error_text = Some(format!("identity backup failed ({error_code})"));
+                    }
+                } else {
+                    self.error_text = Some("identity backup failed (unknown)".to_owned());
+                }
+            }
+            BackendEvent::RecoveryRestoreAck(ack) => {
+                if let Some(error_code) = ack.error_code {
+                    self.show_security_dialog(
+                        SECURITY_TITLE_RESTORE,
+                        format!(
+                            "Identity restore failed. Verify your recovery key or passphrase and try again.\n\nError code: {error_code}"
+                        ),
+                    );
+                    self.clear_error();
+                } else {
+                    self.show_security_dialog(
+                        SECURITY_TITLE_RESTORE,
+                        "Recovery secrets were restored successfully. Encrypted history can now be decrypted on this device.".to_owned(),
+                    );
+                    self.clear_error();
+                }
+            }
             BackendEvent::FatalError { code, message, .. } => {
                 self.pagination.clear_in_flight();
                 warn!(%code, %message, "backend fatal error surfaced to state");
@@ -366,6 +568,41 @@ fn auth_error_text(code: &str) -> String {
         "authentication failed (crypto_store_account_mismatch): local data dir belongs to a different account; set PIKACHAT_DATA_DIR or remove the existing store".to_owned()
     } else {
         format!("authentication failed ({code})")
+    }
+}
+
+fn format_recovery_status(status: &RecoveryStatus) -> String {
+    format!(
+        "Backup state: {}\nBackup enabled locally: {}\nBackup exists on server: {}\nRecovery state: {}",
+        format_key_backup_state(status.backup_state),
+        if status.backup_enabled { "yes" } else { "no" },
+        if status.backup_exists_on_server {
+            "yes"
+        } else {
+            "no"
+        },
+        format_recovery_state(status.recovery_state),
+    )
+}
+
+fn format_key_backup_state(state: KeyBackupState) -> &'static str {
+    match state {
+        KeyBackupState::Unknown => "Unknown",
+        KeyBackupState::Creating => "Creating",
+        KeyBackupState::Enabling => "Enabling",
+        KeyBackupState::Resuming => "Resuming",
+        KeyBackupState::Enabled => "Enabled",
+        KeyBackupState::Downloading => "Downloading",
+        KeyBackupState::Disabling => "Disabling",
+    }
+}
+
+fn format_recovery_state(state: RecoveryState) -> &'static str {
+    match state {
+        RecoveryState::Unknown => "Unknown",
+        RecoveryState::Enabled => "Enabled",
+        RecoveryState::Disabled => "Disabled",
+        RecoveryState::Incomplete => "Incomplete",
     }
 }
 
@@ -632,5 +869,239 @@ mod tests {
 
         let width = clamp_sidebar_width(1_000.0, 100.0);
         assert_eq!(width, 220.0);
+    }
+
+    #[test]
+    fn recovery_status_event_opens_security_dialog() {
+        let mut state = DesktopState::new("@alice:example.org", 50);
+        state.show_security_status_dialog("Checking backup status...");
+        state.handle_backend_event(BackendEvent::RecoveryStatus(RecoveryStatus {
+            backup_state: KeyBackupState::Enabled,
+            backup_enabled: true,
+            backup_exists_on_server: true,
+            recovery_state: RecoveryState::Enabled,
+        }));
+
+        let snapshot = state.snapshot();
+        assert!(snapshot.show_security_dialog);
+        assert_eq!(snapshot.security_dialog_title, "Identity Backup Status");
+        assert!(
+            snapshot
+                .security_dialog_body
+                .contains("Backup enabled locally: yes")
+        );
+        assert!(
+            snapshot
+                .security_dialog_body
+                .contains("Recovery state: Enabled")
+        );
+    }
+
+    #[test]
+    fn recovery_enable_success_shows_recovery_key_dialog() {
+        let mut state = DesktopState::new("@alice:example.org", 50);
+        state.handle_backend_event(BackendEvent::RecoveryEnableAck(
+            backend_core::RecoveryEnableAck {
+                client_txn_id: "txn-r1".to_owned(),
+                recovery_key: Some("word1 word2 word3".to_owned()),
+                error_code: None,
+            },
+        ));
+
+        let snapshot = state.snapshot();
+        assert!(snapshot.show_security_dialog);
+        assert_eq!(snapshot.security_dialog_title, "Identity Backup Created");
+        assert!(snapshot.security_dialog_body.contains("Recovery key:"));
+        assert!(snapshot.security_dialog_body.contains("word1 word2 word3"));
+        assert!(snapshot.security_show_copy_button);
+        assert_eq!(snapshot.security_copy_button_text, "Copy Key");
+        assert_eq!(snapshot.error_text, None);
+    }
+
+    #[test]
+    fn mark_recovery_key_copied_updates_button_label() {
+        let mut state = DesktopState::new("@alice:example.org", 50);
+        state.handle_backend_event(BackendEvent::RecoveryEnableAck(
+            backend_core::RecoveryEnableAck {
+                client_txn_id: "txn-r1".to_owned(),
+                recovery_key: Some("word1 word2 word3".to_owned()),
+                error_code: None,
+            },
+        ));
+
+        assert_eq!(
+            state.recovery_key_for_copy().as_deref(),
+            Some("word1 word2 word3")
+        );
+        state.mark_recovery_key_copied();
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.security_copy_button_text, "Copied");
+    }
+
+    #[test]
+    fn dismiss_security_dialog_hides_modal() {
+        let mut state = DesktopState::new("@alice:example.org", 50);
+        state.show_security_dialog("x", "y");
+        state.dismiss_security_dialog();
+        assert!(!state.snapshot().show_security_dialog);
+        assert_eq!(state.recovery_key_for_copy(), None);
+    }
+
+    #[test]
+    fn recovery_status_does_not_override_recovery_key_dialog() {
+        let mut state = DesktopState::new("@alice:example.org", 50);
+        state.handle_backend_event(BackendEvent::RecoveryEnableAck(
+            backend_core::RecoveryEnableAck {
+                client_txn_id: "txn-r1".to_owned(),
+                recovery_key: Some("word1 word2 word3".to_owned()),
+                error_code: None,
+            },
+        ));
+        state.handle_backend_event(BackendEvent::RecoveryStatus(RecoveryStatus {
+            backup_state: KeyBackupState::Enabled,
+            backup_enabled: true,
+            backup_exists_on_server: true,
+            recovery_state: RecoveryState::Enabled,
+        }));
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.security_dialog_title, "Identity Backup Created");
+        assert!(snapshot.security_dialog_body.contains("word1 word2 word3"));
+    }
+
+    #[test]
+    fn recovery_enable_already_enabled_shows_status_dialog() {
+        let mut state = DesktopState::new("@alice:example.org", 50);
+        state.handle_backend_event(BackendEvent::RecoveryEnableAck(
+            backend_core::RecoveryEnableAck {
+                client_txn_id: "txn-r1".to_owned(),
+                recovery_key: None,
+                error_code: Some("recovery_already_enabled".to_owned()),
+            },
+        ));
+
+        let snapshot = state.snapshot();
+        assert!(snapshot.show_security_dialog);
+        assert_eq!(snapshot.security_dialog_title, "Identity Backup Status");
+        assert!(
+            snapshot
+                .security_dialog_body
+                .contains("already enabled on this client")
+        );
+        assert_eq!(snapshot.error_text, None);
+    }
+
+    #[test]
+    fn recovery_enable_backup_exists_shows_status_dialog() {
+        let mut state = DesktopState::new("@alice:example.org", 50);
+        state.handle_backend_event(BackendEvent::RecoveryEnableAck(
+            backend_core::RecoveryEnableAck {
+                client_txn_id: "txn-r1".to_owned(),
+                recovery_key: None,
+                error_code: Some("recovery_backup_exists".to_owned()),
+            },
+        ));
+
+        let snapshot = state.snapshot();
+        assert!(snapshot.show_security_dialog);
+        assert_eq!(snapshot.security_dialog_title, "Identity Backup Status");
+        assert!(snapshot.security_dialog_body.contains("already exists"));
+        assert_eq!(snapshot.error_text, None);
+    }
+
+    #[test]
+    fn restore_prompt_exposes_input_controls() {
+        let mut state = DesktopState::new("@alice:example.org", 50);
+        state.show_security_restore_prompt_dialog(
+            SECURITY_TITLE_RESTORE,
+            "Enter your recovery key or passphrase.",
+        );
+
+        let snapshot = state.snapshot();
+        assert!(snapshot.show_security_dialog);
+        assert_eq!(snapshot.security_dialog_title, "Identity Restore");
+        assert!(snapshot.security_show_restore_input);
+        assert_eq!(snapshot.security_restore_button_text, "Restore");
+        assert!(!snapshot.security_restore_in_flight);
+        assert_eq!(snapshot.error_text, None);
+    }
+
+    #[test]
+    fn begin_restore_request_is_idempotent_until_dialog_resets() {
+        let mut state = DesktopState::new("@alice:example.org", 50);
+        state.show_security_restore_prompt_dialog(
+            SECURITY_TITLE_RESTORE,
+            "Enter your recovery key or passphrase.",
+        );
+
+        assert!(state.begin_restore_request());
+        assert!(!state.begin_restore_request());
+
+        let snapshot = state.snapshot();
+        assert!(snapshot.security_restore_in_flight);
+        assert_eq!(snapshot.security_restore_button_text, "Restoring...");
+    }
+
+    #[test]
+    fn recovery_restore_ack_success_closes_input_mode_and_shows_success_dialog() {
+        let mut state = DesktopState::new("@alice:example.org", 50);
+        state.show_security_restore_prompt_dialog(
+            SECURITY_TITLE_RESTORE,
+            "Enter your recovery key or passphrase.",
+        );
+        assert!(state.begin_restore_request());
+        state.handle_backend_event(BackendEvent::RecoveryRestoreAck(
+            backend_core::RecoveryRestoreAck {
+                client_txn_id: "txn-restore-1".to_owned(),
+                error_code: None,
+            },
+        ));
+
+        let snapshot = state.snapshot();
+        assert!(snapshot.show_security_dialog);
+        assert_eq!(snapshot.security_dialog_title, "Identity Restore");
+        assert!(
+            snapshot
+                .security_dialog_body
+                .contains("restored successfully")
+        );
+        assert!(!snapshot.security_show_restore_input);
+        assert_eq!(snapshot.security_restore_button_text, "Restore");
+        assert!(!snapshot.security_restore_in_flight);
+        assert_eq!(snapshot.error_text, None);
+    }
+
+    #[test]
+    fn recovery_restore_ack_failure_shows_dialog_with_error_code_and_resets_input_state() {
+        let mut state = DesktopState::new("@alice:example.org", 50);
+        state.show_security_restore_prompt_dialog(
+            SECURITY_TITLE_RESTORE,
+            "Enter your recovery key or passphrase.",
+        );
+        assert!(state.begin_restore_request());
+        state.handle_backend_event(BackendEvent::RecoveryRestoreAck(
+            backend_core::RecoveryRestoreAck {
+                client_txn_id: "txn-restore-2".to_owned(),
+                error_code: Some("bad_recovery_key".to_owned()),
+            },
+        ));
+
+        let snapshot = state.snapshot();
+        assert!(snapshot.show_security_dialog);
+        assert_eq!(snapshot.security_dialog_title, "Identity Restore");
+        assert!(
+            snapshot
+                .security_dialog_body
+                .contains("Verify your recovery key or passphrase")
+        );
+        assert!(
+            snapshot
+                .security_dialog_body
+                .contains("Error code: bad_recovery_key")
+        );
+        assert!(!snapshot.security_show_restore_input);
+        assert_eq!(snapshot.security_restore_button_text, "Restore");
+        assert!(!snapshot.security_restore_in_flight);
+        assert_eq!(snapshot.error_text, None);
     }
 }

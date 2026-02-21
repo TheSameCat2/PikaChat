@@ -24,14 +24,29 @@ export component MainWindow inherits Window {
 
     callback quit-requested();
     callback about-slint-requested();
+    callback security-status-requested();
+    callback backup-identity-requested();
+    callback reset-identity-requested();
+    callback restore-identity-requested();
+    callback security-dialog-dismissed();
+    callback security-copy-requested();
+    callback security-restore-requested(recovery_key: string);
     callback room-selected(index: int);
     callback send-message-requested(text: string) -> bool;
     callback timeline-scrolled(viewport_y: float);
     callback sidebar-width-requested(width_px: float, window_width_px: float);
 
     in-out property <bool> show-about-screen: false;
+    in-out property <bool> show-security-screen: false;
     in-out property <float> sidebar-width-px: 280.0;
     in-out property <string> composer-text: "";
+    in-out property <string> security-title: "Identity Backup";
+    in-out property <string> security-body: "";
+    in-out property <bool> security-show-copy-button: false;
+    in-out property <string> security-copy-button-text: "Copy Key";
+    in-out property <bool> security-show-restore-input: false;
+    in-out property <string> security-restore-button-text: "Restore";
+    in-out property <bool> security-restore-in-flight: false;
 
     in property <[RoomRow]> rooms;
     in property <[MessageRow]> messages;
@@ -58,6 +73,34 @@ export component MainWindow inherits Window {
                 title: "About Slint...";
                 activated => {
                     root.about-slint-requested();
+                }
+            }
+        }
+
+        Menu {
+            title: "Security";
+            MenuItem {
+                title: "Check Backup Status";
+                activated => {
+                    root.security-status-requested();
+                }
+            }
+            MenuItem {
+                title: "Back Up Identity...";
+                activated => {
+                    root.backup-identity-requested();
+                }
+            }
+            MenuItem {
+                title: "Reset Identity Backup...";
+                activated => {
+                    root.reset-identity-requested();
+                }
+            }
+            MenuItem {
+                title: "Restore Identity...";
+                activated => {
+                    root.restore-identity-requested();
                 }
             }
         }
@@ -368,6 +411,93 @@ export component MainWindow inherits Window {
                 y: parent.height - self.height - 18px;
                 clicked => {
                     root.show-about-screen = false;
+                }
+            }
+        }
+    }
+
+    if root.show-security-screen : Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: #00000080;
+
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+        }
+
+        Rectangle {
+            width: 640px;
+            height: 360px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #222a38;
+            border-width: 1px;
+            border-color: #465675;
+            border-radius: 10px;
+
+            Text {
+                x: 16px;
+                y: 16px;
+                width: parent.width - 32px;
+                text: root.security-title;
+                color: #f1f4ff;
+                font-size: 20px;
+                font-weight: 600;
+                overflow: elide;
+            }
+
+            Text {
+                x: 16px;
+                y: 58px;
+                width: parent.width - 32px;
+                height: root.security-show-restore-input ? 82px : (parent.height - 126px);
+                text: root.security-body;
+                color: #d6e1ff;
+                font-size: 14px;
+                wrap: word-wrap;
+                horizontal-alignment: left;
+            }
+
+            restore-input := TextEdit {
+                x: 16px;
+                y: 150px;
+                width: parent.width - 32px;
+                height: parent.height - self.y - 64px;
+                visible: root.security-show-restore-input;
+            }
+
+            restore-btn := Button {
+                text: root.security-restore-button-text;
+                width: 140px;
+                x: 16px;
+                y: parent.height - self.height - 16px;
+                visible: root.security-show-restore-input;
+                enabled: !root.security-restore-in-flight && restore-input.text != "";
+                clicked => {
+                    root.security-restore-requested(restore-input.text);
+                }
+            }
+
+            if root.security-show-copy-button : Button {
+                text: root.security-copy-button-text;
+                width: 120px;
+                x: parent.width - self.width - 126px;
+                y: parent.height - self.height - 16px;
+                clicked => {
+                    root.security-copy-requested();
+                }
+            }
+
+            close-btn := Button {
+                text: "Close";
+                width: 100px;
+                x: parent.width - self.width - 16px;
+                y: parent.height - self.height - 16px;
+                clicked => {
+                    root.security-dialog-dismissed();
                 }
             }
         }

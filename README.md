@@ -27,7 +27,18 @@ PikaChat is aiming to be the Matrix client you open before a match, not after on
 
 ## Current Project State
 
-We have begun a robust backend that implements test-critical Matrix features.
+PikaChat is now in an early but functional desktop MVP phase:
+
+- Rust Matrix backend runtime is live and integrated into the desktop app.
+- Desktop app can authenticate from environment variables, list joined rooms, open a room, render timeline bubbles, and send plain-text messages.
+- Timeline updates live from sync events.
+- Sidebar is resizable and room selection is wired to backend room open/pagination commands.
+- Security menu supports:
+  - `Check Backup Status`
+  - `Back Up Identity...`
+  - `Reset Identity Backup...` (creates a fresh recovery key)
+  - `Restore Identity...` (recovery key/passphrase restore flow)
+- Recovery dialogs include copy-key UX and restore in-flight protections.
 
 ## Architecture (Current)
 
@@ -69,17 +80,26 @@ cargo check --workspace
 cargo test --workspace
 ```
 
-### Run the Desktop Shell
+### Run the Desktop App
+
+For live usage, provide Matrix credentials via env vars:
 
 ```bash
+PIKACHAT_HOMESERVER='https://matrix.example.org' \
+PIKACHAT_USER='@your-user:example.org' \
+PIKACHAT_PASSWORD='your-password' \
 cargo run -p pikachat-desktop
 ```
 
 Expected behavior:
 
-- Window opens with a minimal shell UI.
+- Window opens and attempts session restore/login.
+- Joined rooms appear in the left sidebar.
+- Selecting a room loads timeline items in chat bubbles.
+- Sending a message posts it to the selected room.
 - `File -> Quit` exits cleanly.
 - `Help -> About Slint...` opens the About view containing Slint's built-in `AboutSlint` widget.
+- `Security` menu exposes backup/reset/restore flows.
 
 ### Optional Backend Smoke Run
 
@@ -89,7 +109,16 @@ If you want to exercise backend flows directly:
 cargo run -p backend-smoke
 ```
 
-You can pass env vars for live auth/media smoke (`PIKACHAT_HOMESERVER`, `PIKACHAT_USER`, `PIKACHAT_PASSWORD`, etc.).
+You can pass env vars for live auth/media/recovery smoke (`PIKACHAT_HOMESERVER`, `PIKACHAT_USER`, `PIKACHAT_PASSWORD`, etc.).
+
+Useful flags include:
+
+- `PIKACHAT_START_SYNC=1`
+- `PIKACHAT_DM_TARGET='@user:example.org'`
+- `PIKACHAT_GET_RECOVERY_STATUS=1`
+- `PIKACHAT_ENABLE_RECOVERY=1`
+- `PIKACHAT_RESET_RECOVERY=1`
+- `PIKACHAT_RECOVERY_KEY='...'`
 
 ## Why “Opinionated Matrix Client for Gamers”
 
@@ -102,12 +131,13 @@ Most Matrix clients are general-purpose. PikaChat is intentionally not trying to
 
 ## Next Phase
 
-The next major step is turning the desktop shell into a real client surface:
+Current priorities after this MVP slice:
 
-- connect Slint models to the backend event stream,
-- render room lists and timelines,
-- send/edit/redact from UI,
-- expose media workflows in the interface.
+- improve encrypted-history recovery UX (clearer guidance and key lifecycle handling),
+- continue timeline decryption quality for older encrypted events,
+- add media send/download UI,
+- add proper login/session management UI (instead of env-only startup),
+- keep backend APIs UI-agnostic for future mobile/client reuse.
 
 ## Security Notes
 

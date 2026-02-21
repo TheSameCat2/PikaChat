@@ -116,6 +116,52 @@ fn main() -> Result<(), slint::PlatformError> {
                     bridge.on_timeline_scrolled(viewport_y);
                 });
             }
+            {
+                let bridge = Arc::clone(&spawned_bridge);
+                ui.on_security_status_requested(move || {
+                    debug!("security status requested from ui");
+                    bridge.request_recovery_status();
+                });
+            }
+            {
+                let bridge = Arc::clone(&spawned_bridge);
+                ui.on_backup_identity_requested(move || {
+                    debug!("identity backup requested from ui");
+                    bridge.backup_identity();
+                });
+            }
+            {
+                let bridge = Arc::clone(&spawned_bridge);
+                ui.on_reset_identity_requested(move || {
+                    debug!("identity backup reset requested from ui");
+                    bridge.reset_identity_backup();
+                });
+            }
+            {
+                let bridge = Arc::clone(&spawned_bridge);
+                ui.on_restore_identity_requested(move || {
+                    debug!("identity restore requested from ui");
+                    bridge.prompt_restore_identity();
+                });
+            }
+            {
+                let bridge = Arc::clone(&spawned_bridge);
+                ui.on_security_dialog_dismissed(move || {
+                    bridge.dismiss_security_dialog();
+                });
+            }
+            {
+                let bridge = Arc::clone(&spawned_bridge);
+                ui.on_security_copy_requested(move || {
+                    bridge.copy_recovery_key();
+                });
+            }
+            {
+                let bridge = Arc::clone(&spawned_bridge);
+                ui.on_security_restore_requested(move |recovery_key| {
+                    bridge.restore_identity(recovery_key.to_string());
+                });
+            }
 
             bridge = Some(spawned_bridge);
         }
@@ -129,6 +175,13 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.on_room_selected(|_| {});
             ui.on_send_message_requested(|_| false);
             ui.on_timeline_scrolled(|_| {});
+            ui.on_security_status_requested(|| {});
+            ui.on_backup_identity_requested(|| {});
+            ui.on_reset_identity_requested(|| {});
+            ui.on_restore_identity_requested(|| {});
+            ui.on_security_dialog_dismissed(|| {});
+            ui.on_security_copy_requested(|| {});
+            ui.on_security_restore_requested(|_| {});
         }
     }
 
@@ -190,4 +243,12 @@ fn apply_snapshot_to_ui(ui: &MainWindow, snapshot: DesktopSnapshot) {
     ui.set_error_text(error_text.clone().into());
     ui.set_has_error(!error_text.is_empty());
     ui.set_can_send(snapshot.can_send);
+    ui.set_show_security_screen(snapshot.show_security_dialog);
+    ui.set_security_title(snapshot.security_dialog_title.into());
+    ui.set_security_body(snapshot.security_dialog_body.into());
+    ui.set_security_show_copy_button(snapshot.security_show_copy_button);
+    ui.set_security_copy_button_text(snapshot.security_copy_button_text.into());
+    ui.set_security_show_restore_input(snapshot.security_show_restore_input);
+    ui.set_security_restore_button_text(snapshot.security_restore_button_text.into());
+    ui.set_security_restore_in_flight(snapshot.security_restore_in_flight);
 }
