@@ -30,6 +30,11 @@ Build a Rust-first backend for a desktop Matrix client (UI layer later), with re
 ## Live Validation Notes
 - Live homeserver testing is allowed when needed.
 - Prefer passing live credentials via environment variables instead of storing them in tracked files.
+- Logging is available via `tracing` with severity filters:
+  - global: `RUST_LOG=...`
+  - project fallback: `PIKACHAT_LOG=...`
+  - desktop-specific: `PIKACHAT_DESKTOP_LOG=...`
+  - backend-smoke-specific: `PIKACHAT_SMOKE_LOG=...`
 
 ## User Collaboration Preferences
 - Execute plans to completion autonomously.

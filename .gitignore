@@ -4,5 +4,6 @@
 /.pikachat-smoke-store
 /.pikachat-smoke-store-live-*
 /.pikachat-live-test-*
+/.pikachat-desktop-store
 PLAN.md
 .vscode/

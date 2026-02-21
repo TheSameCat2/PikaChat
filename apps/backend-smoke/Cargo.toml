@@ -10,3 +10,4 @@ backend-core = { path = "../../crates/backend-core" }
 backend-matrix = { path = "../../crates/backend-matrix" }
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -40,8 +40,8 @@ We have begun a robust backend that implements test-critical Matrix features.
   - platform integrations (for example keyring abstraction)
 - `apps/backend-smoke`:
   - smoke/integration command-line harness for live testing
-- `apps/desktop-shell`:
-  - initial Slint desktop UI shell
+- `apps/pikachat-desktop`:
+  - Slint desktop Matrix client shell
 
 ## Clone Instructions
 
@@ -72,7 +72,7 @@ cargo test --workspace
 ### Run the Desktop Shell
 
 ```bash
-cargo run -p desktop-shell
+cargo run -p pikachat-desktop
 ```
 
 Expected behavior:

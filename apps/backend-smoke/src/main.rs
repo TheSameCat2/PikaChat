@@ -10,12 +10,15 @@ use backend_core::{
 };
 use backend_matrix::{MatrixFrontendAdapter, spawn_runtime};
 use tokio::{sync::broadcast, time::timeout};
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 const EVENT_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_SYNC_OBSERVE_SECS: u64 = 8;
 
 #[tokio::main]
 async fn main() {
+    init_logging();
     if let Err(err) = run().await {
         eprintln!("{err}");
         std::process::exit(1);
@@ -31,6 +34,7 @@ async fn run() -> Result<(), String> {
     let restore_session = env_truthy("PIKACHAT_RESTORE_SESSION");
     let init_config = init_config_from_env()?;
 
+    info!("starting backend-smoke harness");
     let runtime = spawn_runtime();
     let adapter = MatrixFrontendAdapter::new(runtime);
     let mut events = adapter.subscribe();
@@ -217,6 +221,33 @@ async fn run() -> Result<(), String> {
 
     adapter.shutdown().await;
     result
+}
+
+fn init_logging() {
+    let env_filter = if let Ok(filter) = EnvFilter::try_from_default_env() {
+        filter
+    } else if let Some(value) = env::var("PIKACHAT_SMOKE_LOG")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        EnvFilter::try_new(value)
+            .unwrap_or_else(|_| EnvFilter::new("info,backend_smoke=debug,backend_matrix=debug"))
+    } else if let Some(value) = env::var("PIKACHAT_LOG")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    {
+        EnvFilter::try_new(value)
+            .unwrap_or_else(|_| EnvFilter::new("info,backend_smoke=debug,backend_matrix=debug"))
+    } else {
+        EnvFilter::new("info,backend_smoke=debug,backend_matrix=debug")
+    };
+
+    let _ = tracing_subscriber::fmt()
+        .with_target(true)
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_env_filter(env_filter)
+        .try_init();
 }
 
 async fn send_command(
