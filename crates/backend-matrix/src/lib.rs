@@ -1244,8 +1244,9 @@ impl MatrixRuntime {
             BackendCommand::LoginPassword {
                 user_id_or_localpart,
                 password,
+                persist_session,
             } => {
-                self.handle_login_password(user_id_or_localpart, password)
+                self.handle_login_password(user_id_or_localpart, password, persist_session)
                     .await;
                 Ok(())
             }
@@ -1410,11 +1411,17 @@ impl MatrixRuntime {
         Ok(())
     }
 
-    async fn handle_login_password(&mut self, user_id_or_localpart: String, password: String) {
+    async fn handle_login_password(
+        &mut self,
+        user_id_or_localpart: String,
+        password: String,
+        persist_session: bool,
+    ) {
         info!(user = %user_id_or_localpart, "handling LoginPassword command");
         let transition = self.validate_transition(BackendCommand::LoginPassword {
             user_id_or_localpart: String::new(),
             password: String::new(),
+            persist_session,
         });
 
         let Ok((candidate, transition_events)) = transition else {
@@ -1446,7 +1453,9 @@ impl MatrixRuntime {
 
         match login_result {
             Ok(()) => {
-                if let Err(err) = self.finalize_successful_password_login(&user_id_or_localpart) {
+                if let Err(err) =
+                    self.finalize_successful_password_login(&user_id_or_localpart, persist_session)
+                {
                     error!(code = %err.code, message = %err.message, "failed to persist session after login");
                     self.finish_auth(false, Some(err));
                 }
@@ -1494,9 +1503,10 @@ impl MatrixRuntime {
                                 .await;
                             match retry_result {
                                 Ok(()) => {
-                                    if let Err(retry_err) = self
-                                        .finalize_successful_password_login(&user_id_or_localpart)
-                                    {
+                                    if let Err(retry_err) = self.finalize_successful_password_login(
+                                        &user_id_or_localpart,
+                                        persist_session,
+                                    ) {
                                         error!(code = %retry_err.code, message = %retry_err.message, "failed to persist session after login retry");
                                         self.finish_auth(false, Some(retry_err));
                                     }
@@ -1664,8 +1674,13 @@ impl MatrixRuntime {
     fn finalize_successful_password_login(
         &mut self,
         user_id_or_localpart: &str,
+        persist_session: bool,
     ) -> Result<(), BackendError> {
-        self.persist_current_session()?;
+        if persist_session {
+            self.persist_current_session()?;
+        } else {
+            self.clear_persisted_session()?;
+        }
         self.persist_device_id_hint_from_current_session()?;
         info!(user = %user_id_or_localpart, "password login succeeded");
         self.finish_auth(true, None);
@@ -1740,50 +1755,11 @@ impl MatrixRuntime {
     async fn recover_from_store_account_mismatch(&mut self) -> Result<(), BackendError> {
         let init_state = self.require_init_state()?.clone();
         let passphrase_account = store_passphrase_account_for_homeserver(&init_state.homeserver);
-
-        if !self.disable_session_persistence {
-            match self.keyring.delete(&init_state.session_account) {
-                Ok(()) | Err(SecretStoreError::NotFound) => {}
-                Err(err) => {
-                    return Err(map_secret_store_error(
-                        "delete_session",
-                        &init_state.session_account,
-                        err,
-                    ));
-                }
-            }
-
-            match self.keyring.delete(&passphrase_account) {
-                Ok(()) | Err(SecretStoreError::NotFound) => {}
-                Err(err) => {
-                    return Err(map_secret_store_error(
-                        "delete_store_passphrase",
-                        &passphrase_account,
-                        err,
-                    ));
-                }
-            }
-        }
-
-        match fs::remove_dir_all(&init_state.data_dir) {
-            Ok(()) => {
-                info!(
-                    data_dir = %init_state.data_dir.display(),
-                    "removed mismatched matrix data directory"
-                );
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(BackendError::new(
-                    BackendErrorCategory::Storage,
-                    "store_reset_failed",
-                    format!(
-                        "failed clearing matrix data dir {}: {err}",
-                        init_state.data_dir.display()
-                    ),
-                ));
-            }
-        }
+        self.wipe_local_persistence(&init_state.data_dir)?;
+        info!(
+            data_dir = %init_state.data_dir.display(),
+            "removed mismatched matrix data directory"
+        );
 
         let store_passphrase =
             self.get_or_create_store_passphrase(&passphrase_account, &init_state.data_dir)?;
@@ -2494,30 +2470,29 @@ impl MatrixRuntime {
     async fn handle_logout(&mut self) -> Result<(), BackendError> {
         let (candidate, transition_events) = self.validate_transition(BackendCommand::Logout)?;
         let backend = self.require_backend()?;
+        let init_state = self.require_init_state()?.clone();
 
         if matches!(self.state_machine.state(), BackendLifecycleState::Syncing) {
             let _ = backend.stop_sync().await;
         }
 
-        backend.logout().await?;
-
-        if !self.disable_session_persistence
-            && let Ok(init_state) = self.require_init_state()
-        {
-            match self.keyring.delete(&init_state.session_account) {
-                Ok(()) | Err(SecretStoreError::NotFound) => {}
-                Err(err) => {
-                    return Err(map_secret_store_error(
-                        "delete_session",
-                        &init_state.session_account,
-                        err,
-                    ));
-                }
-            }
-        }
-
+        let remote_logout_error = backend.logout().await.err();
+        drop(backend);
+        self.backend = None;
+        self.wipe_local_persistence(&init_state.data_dir)?;
+        self.init_state = None;
+        self.runtime_tuning = RuntimeTuning::default();
         self.pagination_tokens.clear();
         self.commit_transition(candidate, transition_events);
+
+        if let Some(err) = remote_logout_error {
+            warn!(
+                code = %err.code,
+                message = %err.message,
+                "remote logout failed; local session and store were still cleared"
+            );
+        }
+
         Ok(())
     }
 
@@ -2610,6 +2585,97 @@ impl MatrixRuntime {
         self.keyring
             .set(&init_state.session_account, &encoded)
             .map_err(|err| map_secret_store_error("set_session", &init_state.session_account, err))
+    }
+
+    fn clear_persisted_session(&self) -> Result<(), BackendError> {
+        if self.disable_session_persistence {
+            return Ok(());
+        }
+
+        let init_state = self.require_init_state()?;
+        match self.keyring.delete(&init_state.session_account) {
+            Ok(()) | Err(SecretStoreError::NotFound) => Ok(()),
+            Err(err) => Err(map_secret_store_error(
+                "delete_session",
+                &init_state.session_account,
+                err,
+            )),
+        }
+    }
+
+    fn clear_store_passphrase_secret(&self) -> Result<(), BackendError> {
+        if self.disable_session_persistence {
+            return Ok(());
+        }
+
+        let init_state = self.require_init_state()?;
+        let passphrase_account = store_passphrase_account_for_homeserver(&init_state.homeserver);
+        match self.keyring.delete(&passphrase_account) {
+            Ok(()) | Err(SecretStoreError::NotFound) => Ok(()),
+            Err(err) => Err(map_secret_store_error(
+                "delete_store_passphrase",
+                &passphrase_account,
+                err,
+            )),
+        }
+    }
+
+    fn clear_device_id_hint_files(&self, data_dir: &Path) -> Result<(), BackendError> {
+        let hint_path = device_id_hint_file_path(data_dir);
+        match fs::remove_file(&hint_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(BackendError::new(
+                    BackendErrorCategory::Storage,
+                    "device_id_hint_file_delete_error",
+                    format!(
+                        "failed deleting device-id hint file {}: {err}",
+                        hint_path.display()
+                    ),
+                ));
+            }
+        }
+
+        let legacy_hint_path = legacy_device_id_hint_file_path(data_dir);
+        match fs::remove_file(&legacy_hint_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(BackendError::new(
+                    BackendErrorCategory::Storage,
+                    "device_id_hint_file_delete_error",
+                    format!(
+                        "failed deleting legacy device-id hint file {}: {err}",
+                        legacy_hint_path.display()
+                    ),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn clear_local_data_dir(&self, data_dir: &Path) -> Result<(), BackendError> {
+        match fs::remove_dir_all(data_dir) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(BackendError::new(
+                BackendErrorCategory::Storage,
+                "store_reset_failed",
+                format!(
+                    "failed clearing matrix data dir {}: {err}",
+                    data_dir.display()
+                ),
+            )),
+        }
+    }
+
+    fn wipe_local_persistence(&self, data_dir: &Path) -> Result<(), BackendError> {
+        self.clear_persisted_session()?;
+        self.clear_store_passphrase_secret()?;
+        self.clear_device_id_hint_files(data_dir)?;
+        self.clear_local_data_dir(data_dir)
     }
 
     fn load_session(&self, session_account: &str) -> Result<MatrixSession, BackendError> {
@@ -3683,6 +3749,7 @@ mod tests {
         rooms: Vec<RoomSummary>,
         login_result: Result<(), BackendError>,
         login_delay: Option<Duration>,
+        logout_result: Result<(), BackendError>,
         start_sync_result: Result<(), BackendError>,
         stop_sync_result: Result<(), BackendError>,
         open_room_result: Result<(Vec<TimelineOp>, Option<String>), BackendError>,
@@ -3712,6 +3779,7 @@ mod tests {
                 rooms,
                 login_result: Ok(()),
                 login_delay: None,
+                logout_result: Ok(()),
                 start_sync_result: Ok(()),
                 stop_sync_result: Ok(()),
                 open_room_result: Ok((Vec::new(), None)),
@@ -3808,6 +3876,11 @@ mod tests {
             self
         }
 
+        fn with_logout_result(mut self, logout_result: Result<(), BackendError>) -> Self {
+            self.logout_result = logout_result;
+            self
+        }
+
         fn with_send_message_result(
             mut self,
             send_message_result: Result<String, BackendError>,
@@ -3899,7 +3972,7 @@ mod tests {
 
         async fn logout(&self) -> Result<(), BackendError> {
             self.record_call("logout");
-            Ok(())
+            self.logout_result.clone()
         }
 
         fn list_rooms(&self) -> Vec<RoomSummary> {
@@ -4600,6 +4673,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -4669,6 +4743,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -4730,6 +4805,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -4790,6 +4866,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -4971,6 +5048,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -5076,6 +5154,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -5140,6 +5219,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -5237,6 +5317,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -5335,6 +5416,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -5411,6 +5493,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -5486,6 +5569,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -5585,6 +5669,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -5649,6 +5734,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -5708,6 +5794,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -5765,6 +5852,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "wrong-password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -5821,6 +5909,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -5887,6 +5976,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -5938,6 +6028,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -5994,6 +6085,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -6050,6 +6142,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -6122,6 +6215,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -6207,6 +6301,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -6360,6 +6455,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_logout_still_transitions_when_remote_logout_fails() {
+        let mock_backend = Arc::new(MockRuntimeBackend::new(Vec::new()).with_logout_result(Err(
+            BackendError::new(
+                BackendErrorCategory::Network,
+                "logout_network_error",
+                "network outage",
+            ),
+        )));
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: None,
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::Logout)
+            .await
+            .expect("logout should enqueue");
+        let logged_out = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::LoggedOut
+                }
+            )
+        })
+        .await;
+        assert!(matches!(
+            logged_out,
+            BackendEvent::StateChanged {
+                state: BackendLifecycleState::LoggedOut
+            }
+        ));
+
+        let fatal = time::timeout(
+            Duration::from_millis(200),
+            recv_matching_event(&mut events, |event| {
+                matches!(event, BackendEvent::FatalError { .. })
+            }),
+        )
+        .await;
+        assert!(
+            fatal.is_err(),
+            "remote logout failures should not emit FatalError"
+        );
+        assert_eq!(mock_backend.calls_snapshot(), vec!["logout"]);
+    }
+
+    #[tokio::test]
     async fn runtime_start_and_stop_sync_happy_path_transitions_state() {
         let mock_backend = Arc::new(MockRuntimeBackend::new(Vec::new()));
         let handle = spawn_runtime_with_backend(mock_backend.clone());
@@ -6387,6 +6546,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -6475,6 +6635,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -6542,6 +6703,7 @@ mod tests {
             .send(BackendCommand::LoginPassword {
                 user_id_or_localpart: "@mock:example.org".to_owned(),
                 password: "password".to_owned(),
+                persist_session: true,
             })
             .await
             .expect("login should enqueue");
@@ -6597,6 +6759,7 @@ mod tests {
         let _login_id = adapter.enqueue(BackendCommand::LoginPassword {
             user_id_or_localpart: "@mock:example.org".to_owned(),
             password: "password".to_owned(),
+            persist_session: true,
         });
         let list_id = adapter.enqueue(BackendCommand::ListRooms);
         let send_id = adapter.enqueue(BackendCommand::SendMessage {
@@ -6680,6 +6843,7 @@ mod tests {
         adapter.enqueue(BackendCommand::LoginPassword {
             user_id_or_localpart: "@mock:example.org".to_owned(),
             password: "password".to_owned(),
+            persist_session: true,
         });
         adapter.enqueue(BackendCommand::OpenRoom {
             room_id: room_id.clone(),
@@ -6766,6 +6930,7 @@ mod tests {
         adapter.enqueue(BackendCommand::LoginPassword {
             user_id_or_localpart: "@mock:example.org".to_owned(),
             password: "password".to_owned(),
+            persist_session: true,
         });
         adapter.enqueue(BackendCommand::OpenRoom {
             room_id: room_id.clone(),

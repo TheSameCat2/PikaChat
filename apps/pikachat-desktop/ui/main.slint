@@ -1,4 +1,4 @@
-import { AboutSlint, Button, ListView, TextEdit } from "std-widgets.slint";
+import { AboutSlint, Button, CheckBox, ListView, TextEdit } from "std-widgets.slint";
 
 export struct RoomRow {
     room_id: string,
@@ -26,6 +26,10 @@ export component MainWindow inherits Window {
     height: 780px;
 
     callback quit-requested();
+    callback login-requested(homeserver: string, user_id: string, password: string, remember_password: bool);
+    callback logout-requested();
+    callback logout-confirmed();
+    callback logout-cancelled();
     callback about-slint-requested();
     callback security-status-requested();
     callback backup-identity-requested();
@@ -42,6 +46,13 @@ export component MainWindow inherits Window {
     callback sidebar-width-requested(width_px: float, window_width_px: float);
 
     in-out property <bool> show-about-screen: false;
+    in-out property <bool> show-login-screen: false;
+    in-out property <string> login-homeserver: "";
+    in-out property <string> login-user-id: "";
+    in-out property <string> login-password: "";
+    in-out property <bool> login-remember-password: false;
+    in-out property <bool> login-in-flight: false;
+    in-out property <bool> show-logout-confirm: false;
     in-out property <bool> show-security-screen: false;
     in-out property <float> sidebar-width-px: 280.0;
     in-out property <string> composer-text: "";
@@ -64,6 +75,12 @@ export component MainWindow inherits Window {
     menu_bar := MenuBar {
         Menu {
             title: "File";
+            MenuItem {
+                title: "Logout";
+                activated => {
+                    root.logout-requested();
+                }
+            }
             MenuItem {
                 title: "Quit";
                 activated => {
@@ -417,6 +434,203 @@ export component MainWindow inherits Window {
                             root.composer-text = "";
                         }
                     }
+                }
+            }
+        }
+    }
+
+    if root.show-login-screen : Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: #0d1320f0;
+
+        Rectangle {
+            width: min(parent.width - 40px, 520px);
+            height: 420px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #1a2232;
+            border-width: 1px;
+            border-color: #465675;
+            border-radius: 12px;
+
+            Text {
+                x: 20px;
+                y: 20px;
+                text: "Log In";
+                color: #f1f4ff;
+                font-size: 24px;
+                font-weight: 700;
+            }
+
+            Text {
+                x: 20px;
+                y: 58px;
+                width: parent.width - 40px;
+                text: "Enter your Matrix account details.";
+                color: #c4d0ea;
+                font-size: 13px;
+            }
+
+            Text {
+                x: 20px;
+                y: 96px;
+                text: "Homeserver Host";
+                color: #c4d0ea;
+                font-size: 12px;
+            }
+            Text {
+                x: 20px;
+                y: 124px;
+                text: "https://";
+                color: #9eb2dc;
+                font-size: 14px;
+            }
+            homeserver-input := TextEdit {
+                x: 84px;
+                y: 116px;
+                width: parent.width - self.x - 20px;
+                height: 36px;
+                text <=> root.login-homeserver;
+                enabled: !root.login-in-flight;
+            }
+
+            Text {
+                x: 20px;
+                y: 162px;
+                text: "User ID";
+                color: #c4d0ea;
+                font-size: 12px;
+            }
+            user-input := TextEdit {
+                x: 20px;
+                y: 182px;
+                width: parent.width - 40px;
+                height: 36px;
+                text <=> root.login-user-id;
+                enabled: !root.login-in-flight;
+            }
+
+            Text {
+                x: 20px;
+                y: 228px;
+                text: "Password";
+                color: #c4d0ea;
+                font-size: 12px;
+            }
+            password-input := TextEdit {
+                x: 20px;
+                y: 248px;
+                width: parent.width - 40px;
+                height: 36px;
+                text <=> root.login-password;
+                enabled: !root.login-in-flight;
+
+                key-pressed(event) => {
+                    if (event.text == Key.Return && !event.modifiers.shift) {
+                        root.login-requested(
+                            root.login-homeserver,
+                            root.login-user-id,
+                            root.login-password,
+                            root.login-remember-password
+                        );
+                        return accept;
+                    }
+                    reject
+                }
+            }
+
+            remember-toggle := CheckBox {
+                x: 20px;
+                y: 300px;
+                width: parent.width - 40px;
+                text: "Remember password";
+                checked <=> root.login-remember-password;
+                enabled: !root.login-in-flight;
+            }
+
+            login-btn := Button {
+                x: parent.width - self.width - 20px;
+                y: parent.height - self.height - 20px;
+                width: 140px;
+                text: root.login-in-flight ? "Logging In..." : "Log In";
+                enabled: !root.login-in-flight
+                    && root.login-homeserver != ""
+                    && root.login-user-id != ""
+                    && root.login-password != "";
+                clicked => {
+                    root.login-requested(
+                        root.login-homeserver,
+                        root.login-user-id,
+                        root.login-password,
+                        root.login-remember-password
+                    );
+                }
+            }
+        }
+    }
+
+    if root.show-logout-confirm : Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: #00000080;
+
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+        }
+
+        Rectangle {
+            width: 480px;
+            height: 220px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #222a38;
+            border-width: 1px;
+            border-color: #465675;
+            border-radius: 10px;
+
+            Text {
+                x: 20px;
+                y: 20px;
+                width: parent.width - 40px;
+                text: "Log Out and Clear Local Data";
+                color: #f1f4ff;
+                font-size: 20px;
+                font-weight: 600;
+            }
+
+            Text {
+                x: 20px;
+                y: 62px;
+                width: parent.width - 40px;
+                text: "This will clear local chat history, encryption keys, and cache on this device.";
+                color: #d6e1ff;
+                font-size: 14px;
+                wrap: word-wrap;
+            }
+
+            cancel-btn := Button {
+                text: "Cancel";
+                width: 100px;
+                x: parent.width - self.width - 136px;
+                y: parent.height - self.height - 16px;
+                clicked => {
+                    root.logout-cancelled();
+                }
+            }
+
+            confirm-btn := Button {
+                text: "Log Out";
+                width: 110px;
+                x: parent.width - self.width - 16px;
+                y: parent.height - self.height - 16px;
+                clicked => {
+                    root.logout-confirmed();
                 }
             }
         }

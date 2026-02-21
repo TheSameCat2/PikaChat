@@ -30,7 +30,15 @@ impl BackendStateMachine {
         use BackendCommand::*;
 
         match command {
-            Init { .. } => self.transition_from_cold(BackendLifecycleState::Configured, "init"),
+            Init { .. } => self.transition_from_any_of(
+                &[
+                    BackendLifecycleState::Cold,
+                    BackendLifecycleState::Configured,
+                    BackendLifecycleState::LoggedOut,
+                ],
+                BackendLifecycleState::Configured,
+                "init",
+            ),
             LoginPassword { .. } | RestoreSession => self.transition_from_any_of(
                 &[
                     BackendLifecycleState::Configured,
@@ -117,18 +125,6 @@ impl BackendStateMachine {
         )
     }
 
-    fn transition_from_cold(
-        &mut self,
-        next: BackendLifecycleState,
-        action: &str,
-    ) -> Result<Vec<BackendEvent>, BackendError> {
-        if self.state != BackendLifecycleState::Cold {
-            return Err(BackendError::invalid_state(self.state, action));
-        }
-        self.state = next;
-        Ok(vec![BackendEvent::StateChanged { state: next }])
-    }
-
     fn transition_from_state(
         &mut self,
         expected: BackendLifecycleState,
@@ -181,6 +177,7 @@ mod tests {
         sm.apply(&BackendCommand::LoginPassword {
             user_id_or_localpart: "@alice:example.org".into(),
             password: "secret".into(),
+            persist_session: true,
         })
         .expect("login command must work");
         assert_eq!(sm.state(), BackendLifecycleState::Authenticating);
@@ -308,6 +305,7 @@ mod tests {
         sm.apply(&BackendCommand::LoginPassword {
             user_id_or_localpart: "@alice:example.org".into(),
             password: "secret".into(),
+            persist_session: true,
         })
         .expect("login command must work");
         sm.on_auth_result(true).expect("auth should resolve");
@@ -325,5 +323,18 @@ mod tests {
             client_txn_id: "tx-2".into(),
         })
         .expect("reject invite should work in syncing state");
+    }
+
+    #[test]
+    fn allows_reinit_after_logout() {
+        let mut sm = BackendStateMachine::default();
+        sm.apply(&init_command()).expect("init must work");
+        sm.apply(&BackendCommand::Logout)
+            .expect("logout should work");
+        assert_eq!(sm.state(), BackendLifecycleState::LoggedOut);
+
+        sm.apply(&init_command())
+            .expect("init should work again after logout");
+        assert_eq!(sm.state(), BackendLifecycleState::Configured);
     }
 }

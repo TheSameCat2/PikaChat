@@ -1,10 +1,16 @@
 //! Environment-backed runtime configuration for `pikachat-desktop`.
 
-use std::{env, error::Error, fmt, path::PathBuf};
+use std::{
+    env,
+    error::Error,
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use backend_core::BackendInitConfig;
 
 const DEFAULT_DATA_DIR_ROOT: &str = "./.pikachat-desktop-store";
+const LOGIN_PROFILE_FILENAME: &str = ".pikachat-login-profile.json";
 const DEFAULT_TIMELINE_MAX_ITEMS: usize = 1_200;
 const DEFAULT_PAGINATE_LIMIT: u16 = 30;
 const DEFAULT_PAGINATION_TOP_THRESHOLD_PX: f32 = 80.0;
@@ -13,14 +19,14 @@ const DEFAULT_PAGINATION_COOLDOWN_MS: u64 = 750;
 /// Runtime configuration used by the desktop app.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DesktopConfig {
-    /// Matrix homeserver URL, for example `https://matrix.example.org`.
-    pub homeserver: String,
-    /// Matrix user ID used for password login and own-message detection.
-    pub user_id: String,
-    /// Password used for startup auth flow.
-    pub password: String,
-    /// Local on-disk store directory.
-    pub data_dir: PathBuf,
+    /// Optional homeserver prefill value for the login form.
+    pub prefill_homeserver: Option<String>,
+    /// Optional user-ID prefill value for the login form.
+    pub prefill_user_id: Option<String>,
+    /// Optional password prefill value for the login form.
+    pub prefill_password: Option<String>,
+    /// Optional fixed data dir override. When set, every login uses this directory.
+    pub data_dir_override: Option<PathBuf>,
     /// Optional backend runtime tuning forwarded to `BackendCommand::Init`.
     pub init_config: Option<BackendInitConfig>,
     /// Timeline cap used by frontend in-memory message retention.
@@ -43,13 +49,12 @@ impl DesktopConfig {
     where
         F: FnMut(&str) -> Option<String>,
     {
-        let homeserver = required_env("PIKACHAT_HOMESERVER", &mut lookup)?;
-        let user_id = required_env("PIKACHAT_USER", &mut lookup)?;
-        let password = required_env("PIKACHAT_PASSWORD", &mut lookup)?;
+        let prefill_homeserver = optional_trimmed_env("PIKACHAT_HOMESERVER", &mut lookup);
+        let prefill_user_id = optional_trimmed_env("PIKACHAT_USER", &mut lookup);
+        let prefill_password = optional_trimmed_env("PIKACHAT_PASSWORD", &mut lookup);
 
-        let data_dir = lookup("PIKACHAT_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| default_data_dir(&homeserver, &user_id));
+        let data_dir_override =
+            optional_trimmed_env("PIKACHAT_DATA_DIR", &mut lookup).map(PathBuf::from);
 
         let sync_request_timeout_ms =
             parse_optional_u64("PIKACHAT_SYNC_REQUEST_TIMEOUT_MS", &mut lookup)?;
@@ -114,10 +119,10 @@ impl DesktopConfig {
         }
 
         Ok(Self {
-            homeserver,
-            user_id,
-            password,
-            data_dir,
+            prefill_homeserver,
+            prefill_user_id,
+            prefill_password,
+            data_dir_override,
             init_config,
             timeline_max_items,
             paginate_limit,
@@ -125,13 +130,34 @@ impl DesktopConfig {
             pagination_cooldown_ms,
         })
     }
+
+    /// Resolve the Matrix SDK store data dir for a login attempt.
+    pub fn data_dir_for_account(&self, homeserver: &str, user_id: &str) -> PathBuf {
+        self.data_dir_override
+            .clone()
+            .unwrap_or_else(|| default_data_dir(homeserver, user_id))
+    }
+
+    /// Location of the desktop login profile metadata file.
+    pub fn auth_profile_path(&self) -> PathBuf {
+        match &self.data_dir_override {
+            Some(data_dir) => data_dir.join(LOGIN_PROFILE_FILENAME),
+            None => PathBuf::from(DEFAULT_DATA_DIR_ROOT).join(LOGIN_PROFILE_FILENAME),
+        }
+    }
+
+    /// Local paths that should be removed for destructive logout.
+    pub fn logout_wipe_targets(&self) -> Vec<PathBuf> {
+        match &self.data_dir_override {
+            Some(data_dir) => vec![data_dir.clone()],
+            None => vec![PathBuf::from(DEFAULT_DATA_DIR_ROOT)],
+        }
+    }
 }
 
 /// Errors produced while parsing runtime configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
-    /// A required environment variable was missing or empty.
-    MissingRequired { key: &'static str },
     /// An environment variable could not be parsed.
     InvalidValue {
         key: &'static str,
@@ -143,9 +169,6 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingRequired { key } => {
-                write!(f, "missing required environment variable: {key}")
-            }
             Self::InvalidValue { key, value, reason } => {
                 write!(f, "invalid {key}='{value}': {reason}")
             }
@@ -155,15 +178,13 @@ impl fmt::Display for ConfigError {
 
 impl Error for ConfigError {}
 
-fn required_env<F>(key: &'static str, lookup: &mut F) -> Result<String, ConfigError>
+fn optional_trimmed_env<F>(key: &'static str, lookup: &mut F) -> Option<String>
 where
     F: FnMut(&str) -> Option<String>,
 {
-    let value = lookup(key).unwrap_or_default();
-    if value.trim().is_empty() {
-        return Err(ConfigError::MissingRequired { key });
-    }
-    Ok(value)
+    lookup(key)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn parse_optional_u16<F>(key: &'static str, lookup: &mut F) -> Result<Option<u16>, ConfigError>
@@ -263,9 +284,13 @@ where
 }
 
 fn default_data_dir(homeserver: &str, user_id: &str) -> PathBuf {
+    default_data_dir_under(Path::new(DEFAULT_DATA_DIR_ROOT), homeserver, user_id)
+}
+
+fn default_data_dir_under(data_dir_root: &Path, homeserver: &str, user_id: &str) -> PathBuf {
     let homeserver_slug = slugify_component(homeserver, 64);
     let user_slug = slugify_component(user_id, 64);
-    PathBuf::from(DEFAULT_DATA_DIR_ROOT)
+    data_dir_root
         .join(format!("hs-{homeserver_slug}"))
         .join(format!("user-{user_slug}"))
 }
@@ -321,7 +346,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_required_fields_and_defaults() {
+    fn parses_prefill_fields_and_defaults() {
         let cfg = config_from_pairs(&[
             ("PIKACHAT_HOMESERVER", "https://matrix.example.org"),
             ("PIKACHAT_USER", "@alice:example.org"),
@@ -329,15 +354,12 @@ mod tests {
         ])
         .expect("config should parse");
 
-        assert_eq!(cfg.homeserver, "https://matrix.example.org");
-        assert_eq!(cfg.user_id, "@alice:example.org");
-        assert_eq!(cfg.password, "secret");
         assert_eq!(
-            cfg.data_dir,
-            Path::new(
-                "./.pikachat-desktop-store/hs-https_matrix_example_org/user-alice_example_org"
-            )
+            cfg.prefill_homeserver.as_deref(),
+            Some("https://matrix.example.org")
         );
+        assert_eq!(cfg.prefill_user_id.as_deref(), Some("@alice:example.org"));
+        assert_eq!(cfg.prefill_password.as_deref(), Some("secret"));
         assert_eq!(cfg.timeline_max_items, DEFAULT_TIMELINE_MAX_ITEMS);
         assert_eq!(cfg.paginate_limit, DEFAULT_PAGINATE_LIMIT);
         assert_eq!(
@@ -349,26 +371,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_required_values() {
-        let err = config_from_pairs(&[
-            ("PIKACHAT_HOMESERVER", "https://matrix.example.org"),
-            ("PIKACHAT_USER", "@alice:example.org"),
-        ])
-        .expect_err("missing password should fail");
-        assert_eq!(
-            err,
-            ConfigError::MissingRequired {
-                key: "PIKACHAT_PASSWORD"
-            }
-        );
+    fn credentials_are_optional_for_login_ui_mode() {
+        let cfg = config_from_pairs(&[]).expect("config without credentials should parse");
+        assert_eq!(cfg.prefill_homeserver, None);
+        assert_eq!(cfg.prefill_user_id, None);
+        assert_eq!(cfg.prefill_password, None);
     }
 
     #[test]
     fn parses_backend_init_tuning_when_present() {
         let cfg = config_from_pairs(&[
-            ("PIKACHAT_HOMESERVER", "https://matrix.example.org"),
-            ("PIKACHAT_USER", "@alice:example.org"),
-            ("PIKACHAT_PASSWORD", "secret"),
             ("PIKACHAT_SYNC_REQUEST_TIMEOUT_MS", "20000"),
             ("PIKACHAT_OPEN_ROOM_LIMIT", "50"),
             ("PIKACHAT_PAGINATION_LIMIT_CAP", "80"),
@@ -376,7 +388,7 @@ mod tests {
         ])
         .expect("config should parse");
 
-        assert_eq!(cfg.data_dir, Path::new("/tmp/pika"));
+        assert_eq!(cfg.data_dir_override, Some(PathBuf::from("/tmp/pika")));
         let init = cfg.init_config.expect("init config should be present");
         assert_eq!(init.sync_request_timeout_ms, Some(20_000));
         assert_eq!(init.default_open_room_limit, Some(50));
@@ -384,42 +396,76 @@ mod tests {
     }
 
     #[test]
-    fn defaults_data_dir_per_homeserver_and_user() {
-        let cfg_a = config_from_pairs(&[
-            ("PIKACHAT_HOMESERVER", "https://matrix.example.org"),
-            ("PIKACHAT_USER", "@alice:example.org"),
-            ("PIKACHAT_PASSWORD", "secret"),
-        ])
-        .expect("config should parse");
-        let cfg_b = config_from_pairs(&[
-            ("PIKACHAT_HOMESERVER", "https://matrix.example.org"),
-            ("PIKACHAT_USER", "@bob:example.org"),
-            ("PIKACHAT_PASSWORD", "secret"),
-        ])
-        .expect("config should parse");
+    fn derives_data_dir_per_homeserver_and_user_without_override() {
+        let cfg = config_from_pairs(&[]).expect("config should parse");
 
-        assert_ne!(cfg_a.data_dir, cfg_b.data_dir);
+        let a = cfg.data_dir_for_account("https://matrix.example.org", "@alice:example.org");
+        let b = cfg.data_dir_for_account("https://matrix.example.org", "@bob:example.org");
+
+        assert_ne!(a, b);
         assert_eq!(
-            cfg_a.data_dir,
+            a,
             Path::new(
                 "./.pikachat-desktop-store/hs-https_matrix_example_org/user-alice_example_org"
             )
         );
         assert_eq!(
-            cfg_b.data_dir,
+            b,
             Path::new("./.pikachat-desktop-store/hs-https_matrix_example_org/user-bob_example_org")
         );
     }
 
     #[test]
+    fn uses_fixed_data_dir_when_override_is_set() {
+        let cfg =
+            config_from_pairs(&[("PIKACHAT_DATA_DIR", "/tmp/pika")]).expect("config should parse");
+
+        assert_eq!(
+            cfg.data_dir_for_account("https://matrix.example.org", "@alice:example.org"),
+            Path::new("/tmp/pika")
+        );
+        assert_eq!(
+            cfg.data_dir_for_account("https://another.example.org", "@bob:example.org"),
+            Path::new("/tmp/pika")
+        );
+    }
+
+    #[test]
+    fn login_profile_path_tracks_data_dir_mode() {
+        let default_cfg = config_from_pairs(&[]).expect("default config should parse");
+        assert_eq!(
+            default_cfg.auth_profile_path(),
+            Path::new("./.pikachat-desktop-store/.pikachat-login-profile.json")
+        );
+
+        let override_cfg = config_from_pairs(&[("PIKACHAT_DATA_DIR", "/tmp/pika")])
+            .expect("override config should parse");
+        assert_eq!(
+            override_cfg.auth_profile_path(),
+            Path::new("/tmp/pika/.pikachat-login-profile.json")
+        );
+    }
+
+    #[test]
+    fn logout_wipe_targets_follow_data_dir_mode() {
+        let default_cfg = config_from_pairs(&[]).expect("default config should parse");
+        assert_eq!(
+            default_cfg.logout_wipe_targets(),
+            vec![PathBuf::from("./.pikachat-desktop-store")]
+        );
+
+        let override_cfg = config_from_pairs(&[("PIKACHAT_DATA_DIR", "/tmp/pika")])
+            .expect("override config should parse");
+        assert_eq!(
+            override_cfg.logout_wipe_targets(),
+            vec![PathBuf::from("/tmp/pika")]
+        );
+    }
+
+    #[test]
     fn rejects_invalid_numeric_values() {
-        let err = config_from_pairs(&[
-            ("PIKACHAT_HOMESERVER", "https://matrix.example.org"),
-            ("PIKACHAT_USER", "@alice:example.org"),
-            ("PIKACHAT_PASSWORD", "secret"),
-            ("PIKACHAT_DESKTOP_PAGINATE_LIMIT", "abc"),
-        ])
-        .expect_err("invalid paginate value should fail");
+        let err = config_from_pairs(&[("PIKACHAT_DESKTOP_PAGINATE_LIMIT", "abc")])
+            .expect_err("invalid paginate value should fail");
 
         assert!(matches!(
             err,

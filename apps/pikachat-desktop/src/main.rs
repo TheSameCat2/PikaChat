@@ -1,3 +1,4 @@
+mod auth_profile;
 mod bridge;
 mod config;
 mod logging;
@@ -64,9 +65,6 @@ fn main() -> Result<(), slint::PlatformError> {
     match desktop_config {
         Ok(config) => {
             info!(
-                homeserver = %config.homeserver,
-                user_id = %config.user_id,
-                data_dir = %config.data_dir.display(),
                 timeline_max_items = config.timeline_max_items,
                 paginate_limit = config.paginate_limit,
                 "desktop config loaded"
@@ -93,6 +91,35 @@ fn main() -> Result<(), slint::PlatformError> {
             let spawned_bridge =
                 DesktopBridge::spawn(config, adapter, runtime.handle().clone(), ui_update);
 
+            {
+                let bridge = Arc::clone(&spawned_bridge);
+                ui.on_login_requested(move |homeserver, user_id, password, remember_password| {
+                    bridge.submit_login(
+                        homeserver.to_string(),
+                        user_id.to_string(),
+                        password.to_string(),
+                        remember_password,
+                    );
+                });
+            }
+            {
+                let bridge = Arc::clone(&spawned_bridge);
+                ui.on_logout_requested(move || {
+                    bridge.request_logout_confirmation();
+                });
+            }
+            {
+                let bridge = Arc::clone(&spawned_bridge);
+                ui.on_logout_confirmed(move || {
+                    bridge.confirm_logout();
+                });
+            }
+            {
+                let bridge = Arc::clone(&spawned_bridge);
+                ui.on_logout_cancelled(move || {
+                    bridge.cancel_logout_confirmation();
+                });
+            }
             {
                 let bridge = Arc::clone(&spawned_bridge);
                 ui.on_room_selected(move |index| {
@@ -185,6 +212,10 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_has_error(true);
             ui.set_can_send(false);
 
+            ui.on_login_requested(|_, _, _, _| {});
+            ui.on_logout_requested(|| {});
+            ui.on_logout_confirmed(|| {});
+            ui.on_logout_cancelled(|| {});
             ui.on_room_selected(|_| {});
             ui.on_room_invite_accept_requested(|_| {});
             ui.on_room_invite_reject_requested(|_| {});
@@ -261,6 +292,13 @@ fn apply_snapshot_to_ui(ui: &MainWindow, snapshot: DesktopSnapshot) {
     ui.set_error_text(error_text.clone().into());
     ui.set_has_error(!error_text.is_empty());
     ui.set_can_send(snapshot.can_send);
+    ui.set_show_login_screen(snapshot.show_login_screen);
+    ui.set_login_homeserver(snapshot.login_homeserver.into());
+    ui.set_login_user_id(snapshot.login_user_id.into());
+    ui.set_login_password(snapshot.login_password.into());
+    ui.set_login_remember_password(snapshot.login_remember_password);
+    ui.set_login_in_flight(snapshot.login_in_flight);
+    ui.set_show_logout_confirm(snapshot.show_logout_confirm);
     ui.set_show_security_screen(snapshot.show_security_dialog);
     ui.set_security_title(snapshot.security_dialog_title.into());
     ui.set_security_body(snapshot.security_dialog_body.into());

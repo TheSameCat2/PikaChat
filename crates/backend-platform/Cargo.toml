@@ -11,6 +11,7 @@ thiserror.workspace = true
 [dependencies.keyring]
 version = "3.6.2"
 default-features = false
+features = ["apple-native", "linux-native", "windows-native"]
 optional = true
 
 [features]
