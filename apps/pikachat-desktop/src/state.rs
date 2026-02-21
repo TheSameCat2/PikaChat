@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use backend_core::types::{InviteAction, InviteActionAck, RoomMembership};
 use backend_core::{
     BackendEvent, BackendLifecycleState, KeyBackupState, RecoveryState, RecoveryStatus,
     RoomSummary, SendAck, SyncStatus, TimelineItem, TimelineOp,
@@ -33,6 +34,9 @@ pub struct RoomView {
     pub unread_notifications: u64,
     pub highlight_count: u64,
     pub is_selected: bool,
+    pub membership: RoomMembership,
+    pub invite_pending: bool,
+    pub invite_pending_text: String,
 }
 
 /// Timeline message row consumed by the Slint UI.
@@ -50,6 +54,8 @@ pub struct DesktopSnapshot {
     pub rooms: Vec<RoomView>,
     pub messages: Vec<MessageView>,
     pub selected_room_id: Option<String>,
+    pub selected_room_is_invite: bool,
+    pub selected_room_invite_pending_text: Option<String>,
     pub status_text: String,
     pub error_text: Option<String>,
     pub can_send: bool,
@@ -115,6 +121,8 @@ pub struct DesktopState {
     status_text: String,
     error_text: Option<String>,
     pending_sends: HashSet<String>,
+    pending_invite_actions: HashMap<String, InviteAction>,
+    pending_invite_actions_by_txn: HashMap<String, String>,
     pagination: PaginationTracker,
     show_security_dialog: bool,
     security_dialog_title: String,
@@ -141,6 +149,8 @@ impl DesktopState {
             status_text: DEFAULT_STATUS.to_owned(),
             error_text: None,
             pending_sends: HashSet::new(),
+            pending_invite_actions: HashMap::new(),
+            pending_invite_actions_by_txn: HashMap::new(),
             pagination: PaginationTracker::default(),
             show_security_dialog: false,
             security_dialog_title: String::new(),
@@ -157,13 +167,26 @@ impl DesktopState {
 
     /// Current immutable snapshot for UI rendering.
     pub fn snapshot(&self) -> DesktopSnapshot {
+        let selected_room = self.selected_room();
+        let selected_room_is_invite = selected_room
+            .map(|room| room.membership == RoomMembership::Invited)
+            .unwrap_or(false);
+        let selected_room_invite_pending_text = selected_room.and_then(|room| {
+            if room.invite_pending {
+                Some(room.invite_pending_text.clone())
+            } else {
+                None
+            }
+        });
         DesktopSnapshot {
             rooms: self.rooms.clone(),
             messages: self.messages.clone(),
             selected_room_id: self.selected_room_id.clone(),
+            selected_room_is_invite,
+            selected_room_invite_pending_text,
             status_text: self.status_text.clone(),
             error_text: self.error_text.clone(),
-            can_send: self.selected_room_id.is_some(),
+            can_send: self.can_send_message(),
             show_security_dialog: self.show_security_dialog,
             security_dialog_title: self.security_dialog_title.clone(),
             security_dialog_body: self.security_dialog_body.clone(),
@@ -295,26 +318,65 @@ impl DesktopState {
         self.selected_room_id.as_deref()
     }
 
+    /// Returns `true` when the selected room can accept outgoing messages.
+    pub fn can_send_message(&self) -> bool {
+        self.selected_room()
+            .map(|room| room.membership == RoomMembership::Joined)
+            .unwrap_or(false)
+    }
+
+    /// Returns `true` when the room exists and is currently an invite.
+    pub fn is_invite_room(&self, room_id: &str) -> bool {
+        self.rooms
+            .iter()
+            .find(|room| room.room_id == room_id)
+            .map(|room| room.membership == RoomMembership::Invited)
+            .unwrap_or(false)
+    }
+
+    /// Returns `true` when an invite action is currently pending for this room.
+    pub fn has_pending_invite_action(&self, room_id: &str) -> bool {
+        self.pending_invite_actions.contains_key(room_id)
+    }
+
     /// Update room list while preserving backend ordering.
     pub fn replace_rooms(&mut self, rooms: Vec<RoomSummary>) {
         let selected = self.selected_room_id.clone();
-        self.rooms = rooms
-            .into_iter()
-            .map(|room| {
-                let display_name = room
+        let mut invited = Vec::new();
+        let mut non_invited = Vec::new();
+        for room in rooms {
+            let room_id = room.room_id.clone();
+            let membership = room.membership;
+            let pending_action = self.pending_invite_actions.get(&room_id).copied();
+            let mapped = RoomView {
+                room_id: room_id.clone(),
+                display_name: room
                     .name
                     .clone()
                     .filter(|value| !value.trim().is_empty())
-                    .unwrap_or_else(|| room.room_id.clone());
-                RoomView {
-                    room_id: room.room_id.clone(),
-                    display_name,
-                    unread_notifications: room.unread_notifications,
-                    highlight_count: room.highlight_count,
-                    is_selected: selected.as_deref() == Some(room.room_id.as_str()),
-                }
-            })
-            .collect();
+                    .unwrap_or_else(|| room_id.clone()),
+                unread_notifications: room.unread_notifications,
+                highlight_count: room.highlight_count,
+                is_selected: selected.as_deref() == Some(room_id.as_str()),
+                membership,
+                invite_pending: pending_action.is_some(),
+                invite_pending_text: pending_action
+                    .map(invite_pending_text)
+                    .unwrap_or_default()
+                    .to_owned(),
+            };
+            if membership == RoomMembership::Invited {
+                invited.push(mapped);
+            } else {
+                non_invited.push(mapped);
+            }
+        }
+        invited.append(&mut non_invited);
+        self.rooms = invited;
+        self.pending_invite_actions
+            .retain(|room_id, _| self.rooms.iter().any(|room| room.room_id == *room_id));
+        self.pending_invite_actions_by_txn
+            .retain(|_, room_id| self.pending_invite_actions.contains_key(room_id));
         debug!(room_count = self.rooms.len(), "room list replaced");
 
         if let Some(selected_room_id) = &self.selected_room_id
@@ -327,6 +389,26 @@ impl DesktopState {
             self.selected_room_id = None;
             self.messages.clear();
         }
+    }
+
+    /// Mark invite action request as pending for room + transaction id.
+    pub fn mark_invite_action_requested(
+        &mut self,
+        room_id: String,
+        client_txn_id: String,
+        action: InviteAction,
+    ) -> bool {
+        if !self.is_invite_room(&room_id) || self.has_pending_invite_action(&room_id) {
+            return false;
+        }
+        self.pending_invite_actions.insert(room_id.clone(), action);
+        self.pending_invite_actions_by_txn
+            .insert(client_txn_id, room_id.clone());
+        if let Some(room) = self.rooms.iter_mut().find(|room| room.room_id == room_id) {
+            room.invite_pending = true;
+            room.invite_pending_text = invite_pending_text(action).to_owned();
+        }
+        true
     }
 
     /// Select room by sidebar index and return selected room ID.
@@ -346,6 +428,13 @@ impl DesktopState {
         self.rebuild_visible_messages();
     }
 
+    fn selected_room(&self) -> Option<&RoomView> {
+        let selected_room_id = self.selected_room_id.as_deref()?;
+        self.rooms
+            .iter()
+            .find(|room| room.room_id == selected_room_id)
+    }
+
     /// Mark a send as pending using its client transaction ID.
     pub fn mark_send_requested(&mut self, client_txn_id: String) {
         self.pending_sends.insert(client_txn_id);
@@ -363,6 +452,29 @@ impl DesktopState {
             self.error_text = Some(format!("send failed ({error_code})"));
         } else {
             debug!(client_txn_id = %ack.client_txn_id, "send acknowledgement succeeded");
+            self.clear_error();
+        }
+    }
+
+    /// Handle invite action acknowledgement from backend.
+    pub fn handle_invite_action_ack(&mut self, ack: InviteActionAck) {
+        let room_id = self
+            .pending_invite_actions_by_txn
+            .remove(&ack.client_txn_id)
+            .unwrap_or_else(|| ack.room_id.clone());
+        self.pending_invite_actions.remove(&room_id);
+        if let Some(room) = self.rooms.iter_mut().find(|room| room.room_id == room_id) {
+            room.invite_pending = false;
+            room.invite_pending_text.clear();
+        }
+
+        if let Some(error_code) = ack.error_code {
+            let action = match ack.action {
+                InviteAction::Accept => "accept",
+                InviteAction::Reject => "reject",
+            };
+            self.error_text = Some(format!("invite {action} failed ({error_code})"));
+        } else {
             self.clear_error();
         }
     }
@@ -435,6 +547,9 @@ impl DesktopState {
             }
             BackendEvent::SendAck(ack) => {
                 self.handle_send_ack(ack);
+            }
+            BackendEvent::InviteActionAck(ack) => {
+                self.handle_invite_action_ack(ack);
             }
             BackendEvent::RecoveryStatus(status) => {
                 // Avoid replacing freshly shown recovery keys with trailing status events.
@@ -571,6 +686,13 @@ fn auth_error_text(code: &str) -> String {
     }
 }
 
+fn invite_pending_text(action: InviteAction) -> &'static str {
+    match action {
+        InviteAction::Accept => "Accepting invite...",
+        InviteAction::Reject => "Rejecting invite...",
+    }
+}
+
 fn format_recovery_status(status: &RecoveryStatus) -> String {
     format!(
         "Backup state: {}\nBackup enabled locally: {}\nBackup exists on server: {}\nRecovery state: {}",
@@ -667,36 +789,77 @@ mod tests {
         }
     }
 
-    fn room(room_id: &str, name: &str, unread: u64, highlight: u64) -> RoomSummary {
+    fn room(
+        room_id: &str,
+        name: &str,
+        unread: u64,
+        highlight: u64,
+        membership: RoomMembership,
+    ) -> RoomSummary {
         RoomSummary {
             room_id: room_id.to_owned(),
             name: Some(name.to_owned()),
             unread_notifications: unread,
             highlight_count: highlight,
             is_direct: false,
+            membership,
         }
     }
 
     #[test]
-    fn room_list_keeps_backend_order_and_no_auto_selection() {
+    fn room_list_places_invites_first_with_stable_backend_order_and_no_auto_selection() {
         let mut state = DesktopState::new("@alice:example.org", 50);
         state.replace_rooms(vec![
-            room("!b:example.org", "B", 2, 1),
-            room("!a:example.org", "A", 0, 0),
+            room(
+                "!joined-2:example.org",
+                "Joined2",
+                2,
+                1,
+                RoomMembership::Joined,
+            ),
+            room(
+                "!invite-1:example.org",
+                "Invite1",
+                0,
+                0,
+                RoomMembership::Invited,
+            ),
+            room(
+                "!joined-1:example.org",
+                "Joined1",
+                0,
+                0,
+                RoomMembership::Joined,
+            ),
+            room(
+                "!invite-2:example.org",
+                "Invite2",
+                0,
+                0,
+                RoomMembership::Invited,
+            ),
         ]);
 
         let snapshot = state.snapshot();
         assert_eq!(snapshot.selected_room_id, None);
-        assert_eq!(snapshot.rooms[0].room_id, "!b:example.org");
-        assert_eq!(snapshot.rooms[0].unread_notifications, 2);
-        assert_eq!(snapshot.rooms[0].highlight_count, 1);
-        assert_eq!(snapshot.rooms[1].room_id, "!a:example.org");
+        assert_eq!(snapshot.rooms[0].room_id, "!invite-1:example.org");
+        assert_eq!(snapshot.rooms[1].room_id, "!invite-2:example.org");
+        assert_eq!(snapshot.rooms[2].room_id, "!joined-2:example.org");
+        assert_eq!(snapshot.rooms[2].unread_notifications, 2);
+        assert_eq!(snapshot.rooms[2].highlight_count, 1);
+        assert_eq!(snapshot.rooms[3].room_id, "!joined-1:example.org");
     }
 
     #[test]
     fn selecting_room_marks_selected_state() {
         let mut state = DesktopState::new("@alice:example.org", 50);
-        state.replace_rooms(vec![room("!r1:example.org", "R1", 0, 0)]);
+        state.replace_rooms(vec![room(
+            "!r1:example.org",
+            "R1",
+            0,
+            0,
+            RoomMembership::Joined,
+        )]);
         let selected = state.select_room_by_index(0);
 
         assert_eq!(selected.as_deref(), Some("!r1:example.org"));
@@ -711,7 +874,13 @@ mod tests {
     #[test]
     fn snapshot_mapping_sets_own_message_alignment() {
         let mut state = DesktopState::new("@alice:example.org", 50);
-        state.replace_rooms(vec![room("!r1:example.org", "R1", 0, 0)]);
+        state.replace_rooms(vec![room(
+            "!r1:example.org",
+            "R1",
+            0,
+            0,
+            RoomMembership::Joined,
+        )]);
         state.select_room("!r1:example.org".to_owned());
         state.handle_backend_event(BackendEvent::RoomTimelineSnapshot {
             room_id: "!r1:example.org".to_owned(),
@@ -742,6 +911,55 @@ mod tests {
             snapshot.error_text.as_deref(),
             Some("send failed (forbidden)")
         );
+    }
+
+    #[test]
+    fn invite_selection_disables_sending_and_exposes_snapshot_flags() {
+        let mut state = DesktopState::new("@alice:example.org", 50);
+        state.replace_rooms(vec![room(
+            "!invite:example.org",
+            "Invite",
+            0,
+            0,
+            RoomMembership::Invited,
+        )]);
+        state.select_room("!invite:example.org".to_owned());
+
+        let snapshot = state.snapshot();
+        assert!(!snapshot.can_send);
+        assert!(snapshot.selected_room_is_invite);
+        assert_eq!(snapshot.selected_room_invite_pending_text, None);
+    }
+
+    #[test]
+    fn invite_ack_clears_pending_and_sets_error_on_failure() {
+        let mut state = DesktopState::new("@alice:example.org", 50);
+        state.replace_rooms(vec![room(
+            "!invite:example.org",
+            "Invite",
+            0,
+            0,
+            RoomMembership::Invited,
+        )]);
+        assert!(state.mark_invite_action_requested(
+            "!invite:example.org".to_owned(),
+            "txn-invite-1".to_owned(),
+            InviteAction::Accept,
+        ));
+        state.handle_backend_event(BackendEvent::InviteActionAck(InviteActionAck {
+            client_txn_id: "txn-invite-1".to_owned(),
+            room_id: "!invite:example.org".to_owned(),
+            action: InviteAction::Accept,
+            error_code: Some("not_invited".to_owned()),
+        }));
+
+        let snapshot = state.snapshot();
+        assert_eq!(
+            snapshot.error_text.as_deref(),
+            Some("invite accept failed (not_invited)")
+        );
+        assert!(!snapshot.rooms[0].invite_pending);
+        assert!(snapshot.rooms[0].invite_pending_text.is_empty());
     }
 
     #[test]
@@ -788,7 +1006,13 @@ mod tests {
     #[test]
     fn pagination_trigger_respects_top_threshold_inflight_and_cooldown() {
         let mut state = DesktopState::new("@alice:example.org", 50);
-        state.replace_rooms(vec![room("!r1:example.org", "R1", 0, 0)]);
+        state.replace_rooms(vec![room(
+            "!r1:example.org",
+            "R1",
+            0,
+            0,
+            RoomMembership::Joined,
+        )]);
         state.select_room("!r1:example.org".to_owned());
 
         assert_eq!(
@@ -817,7 +1041,13 @@ mod tests {
     #[test]
     fn dedupe_and_trim_keeps_latest_event_instance() {
         let mut state = DesktopState::new("@alice:example.org", 2);
-        state.replace_rooms(vec![room("!r1:example.org", "R1", 0, 0)]);
+        state.replace_rooms(vec![room(
+            "!r1:example.org",
+            "R1",
+            0,
+            0,
+            RoomMembership::Joined,
+        )]);
         state.select_room("!r1:example.org".to_owned());
         state.handle_backend_event(BackendEvent::RoomTimelineSnapshot {
             room_id: "!r1:example.org".to_owned(),
@@ -838,7 +1068,13 @@ mod tests {
     #[test]
     fn apply_delta_handles_update_and_remove_leniently() {
         let mut state = DesktopState::new("@alice:example.org", 50);
-        state.replace_rooms(vec![room("!r1:example.org", "R1", 0, 0)]);
+        state.replace_rooms(vec![room(
+            "!r1:example.org",
+            "R1",
+            0,
+            0,
+            RoomMembership::Joined,
+        )]);
         state.select_room("!r1:example.org".to_owned());
         state.handle_backend_event(BackendEvent::RoomTimelineSnapshot {
             room_id: "!r1:example.org".to_owned(),

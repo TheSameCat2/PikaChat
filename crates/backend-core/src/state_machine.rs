@@ -60,6 +60,8 @@ impl BackendStateMachine {
                 "logout",
             ),
             ListRooms
+            | AcceptRoomInvite { .. }
+            | RejectRoomInvite { .. }
             | OpenRoom { .. }
             | PaginateBack { .. }
             | SendDmText { .. }
@@ -281,5 +283,47 @@ mod tests {
             })
             .expect_err("reset recovery should fail when not authenticated");
         assert_eq!(err.code, "invalid_state_transition");
+
+        let err = sm
+            .apply(&BackendCommand::AcceptRoomInvite {
+                room_id: "!abc:example.org".into(),
+                client_txn_id: "tx-8".into(),
+            })
+            .expect_err("accept invite should fail when not authenticated");
+        assert_eq!(err.code, "invalid_state_transition");
+
+        let err = sm
+            .apply(&BackendCommand::RejectRoomInvite {
+                room_id: "!abc:example.org".into(),
+                client_txn_id: "tx-9".into(),
+            })
+            .expect_err("reject invite should fail when not authenticated");
+        assert_eq!(err.code, "invalid_state_transition");
+    }
+
+    #[test]
+    fn allows_invite_commands_in_authenticated_context() {
+        let mut sm = BackendStateMachine::default();
+        sm.apply(&init_command()).expect("init must work");
+        sm.apply(&BackendCommand::LoginPassword {
+            user_id_or_localpart: "@alice:example.org".into(),
+            password: "secret".into(),
+        })
+        .expect("login command must work");
+        sm.on_auth_result(true).expect("auth should resolve");
+
+        sm.apply(&BackendCommand::AcceptRoomInvite {
+            room_id: "!abc:example.org".into(),
+            client_txn_id: "tx-1".into(),
+        })
+        .expect("accept invite should work in authenticated state");
+
+        sm.apply(&BackendCommand::StartSync)
+            .expect("start sync should work");
+        sm.apply(&BackendCommand::RejectRoomInvite {
+            room_id: "!abc:example.org".into(),
+            client_txn_id: "tx-2".into(),
+        })
+        .expect("reject invite should work in syncing state");
     }
 }

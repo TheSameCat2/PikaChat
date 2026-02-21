@@ -17,6 +17,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use backend_core::types::{InviteAction, InviteActionAck, RoomMembership};
 use backend_core::{
     BackendChannelError, BackendChannels, BackendCommand, BackendError, BackendErrorCategory,
     BackendEvent, BackendInitConfig, BackendLifecycleState, BackendStateMachine, EventStream,
@@ -27,7 +28,7 @@ use backend_core::{
 };
 use backend_platform::{OsKeyringSecretStore, ScopedSecretStore, SecretStoreError};
 use matrix_sdk::{
-    Client, ClientBuildError, HttpError,
+    Client, ClientBuildError, HttpError, RoomState,
     authentication::matrix::MatrixSession,
     config::RequestConfig,
     config::SyncSettings,
@@ -493,6 +494,18 @@ impl MatrixBackend {
         Ok(response.event_id.to_string())
     }
 
+    /// Accept a pending room invite.
+    pub async fn accept_room_invite(&self, room_id: &str) -> Result<(), BackendError> {
+        let room = self.lookup_room(room_id)?;
+        room.join().await.map_err(map_matrix_error)
+    }
+
+    /// Reject a pending room invite.
+    pub async fn reject_room_invite(&self, room_id: &str) -> Result<(), BackendError> {
+        let room = self.lookup_room(room_id)?;
+        room.leave().await.map_err(map_matrix_error)
+    }
+
     /// Upload raw media bytes and return the resulting `mxc://` URI string.
     pub async fn upload_media(
         &self,
@@ -683,6 +696,8 @@ trait RuntimeBackend: Send + Sync {
         limit: u16,
     ) -> Result<(Vec<TimelineOp>, Option<String>), BackendError>;
     async fn send_dm_text(&self, user_id: &str, body: &str) -> Result<String, BackendError>;
+    async fn accept_room_invite(&self, room_id: &str) -> Result<(), BackendError>;
+    async fn reject_room_invite(&self, room_id: &str) -> Result<(), BackendError>;
     async fn upload_media(&self, content_type: &str, data: Vec<u8>)
     -> Result<String, BackendError>;
     async fn download_media(&self, source: &str) -> Result<Vec<u8>, BackendError>;
@@ -793,6 +808,14 @@ impl RuntimeBackend for MatrixBackend {
 
     async fn send_dm_text(&self, user_id: &str, body: &str) -> Result<String, BackendError> {
         MatrixBackend::send_dm_text(self, user_id, body).await
+    }
+
+    async fn accept_room_invite(&self, room_id: &str) -> Result<(), BackendError> {
+        MatrixBackend::accept_room_invite(self, room_id).await
+    }
+
+    async fn reject_room_invite(&self, room_id: &str) -> Result<(), BackendError> {
+        MatrixBackend::reject_room_invite(self, room_id).await
     }
 
     async fn upload_media(
@@ -1233,6 +1256,22 @@ impl MatrixRuntime {
             BackendCommand::StartSync => self.handle_start_sync().await,
             BackendCommand::StopSync => self.handle_stop_sync().await,
             BackendCommand::ListRooms => self.handle_list_rooms(),
+            BackendCommand::AcceptRoomInvite {
+                room_id,
+                client_txn_id,
+            } => {
+                self.handle_invite_action(room_id, client_txn_id, InviteAction::Accept)
+                    .await;
+                Ok(())
+            }
+            BackendCommand::RejectRoomInvite {
+                room_id,
+                client_txn_id,
+            } => {
+                self.handle_invite_action(room_id, client_txn_id, InviteAction::Reject)
+                    .await;
+                Ok(())
+            }
             BackendCommand::OpenRoom { room_id } => self.handle_open_room(room_id).await,
             BackendCommand::PaginateBack { room_id, limit } => {
                 self.handle_paginate_back(room_id, limit).await
@@ -1797,6 +1836,75 @@ impl MatrixRuntime {
         debug!(room_count = rooms.len(), "emitting RoomListUpdated");
         self.channels.emit(BackendEvent::RoomListUpdated { rooms });
         Ok(())
+    }
+
+    async fn handle_invite_action(
+        &mut self,
+        room_id: String,
+        client_txn_id: String,
+        action: InviteAction,
+    ) {
+        debug!(
+            room_id = %room_id,
+            client_txn_id = %client_txn_id,
+            action = ?action,
+            "handling room invite action command"
+        );
+
+        let validation = match action {
+            InviteAction::Accept => self.validate_transition(BackendCommand::AcceptRoomInvite {
+                room_id: String::new(),
+                client_txn_id: String::new(),
+            }),
+            InviteAction::Reject => self.validate_transition(BackendCommand::RejectRoomInvite {
+                room_id: String::new(),
+                client_txn_id: String::new(),
+            }),
+        };
+
+        if let Err(err) = validation {
+            self.channels
+                .emit(BackendEvent::InviteActionAck(InviteActionAck {
+                    client_txn_id,
+                    room_id,
+                    action,
+                    error_code: Some(err.code),
+                }));
+            return;
+        }
+
+        let backend = match self.require_backend() {
+            Ok(backend) => backend,
+            Err(err) => {
+                self.channels
+                    .emit(BackendEvent::InviteActionAck(InviteActionAck {
+                        client_txn_id,
+                        room_id,
+                        action,
+                        error_code: Some(err.code),
+                    }));
+                return;
+            }
+        };
+
+        let result = match action {
+            InviteAction::Accept => backend.accept_room_invite(&room_id).await,
+            InviteAction::Reject => backend.reject_room_invite(&room_id).await,
+        };
+
+        let error_code = result.err().map(|err| err.code);
+        self.channels
+            .emit(BackendEvent::InviteActionAck(InviteActionAck {
+                client_txn_id,
+                room_id: room_id.clone(),
+                action,
+                error_code: error_code.clone(),
+            }));
+
+        if error_code.is_none() {
+            let rooms = backend.list_rooms();
+            self.channels.emit(BackendEvent::RoomListUpdated { rooms });
+        }
     }
 
     async fn handle_open_room(&mut self, room_id: String) -> Result<(), BackendError> {
@@ -2568,6 +2676,8 @@ fn command_kind(command: &BackendCommand) -> &'static str {
         BackendCommand::StartSync => "StartSync",
         BackendCommand::StopSync => "StopSync",
         BackendCommand::ListRooms => "ListRooms",
+        BackendCommand::AcceptRoomInvite { .. } => "AcceptRoomInvite",
+        BackendCommand::RejectRoomInvite { .. } => "RejectRoomInvite",
         BackendCommand::OpenRoom { .. } => "OpenRoom",
         BackendCommand::PaginateBack { .. } => "PaginateBack",
         BackendCommand::SendDmText { .. } => "SendDmText",
@@ -3200,15 +3310,21 @@ fn collect_room_summaries(client: &Client) -> Vec<RoomSummary> {
     let mut rooms: Vec<RoomSummary> = client
         .rooms()
         .into_iter()
-        .map(|room| {
+        .filter_map(|room| {
+            let membership = match room.state() {
+                RoomState::Joined => RoomMembership::Joined,
+                RoomState::Invited => RoomMembership::Invited,
+                _ => return None,
+            };
             let unread = room.unread_notification_counts();
-            RoomSummary {
+            Some(RoomSummary {
                 room_id: room.room_id().to_string(),
                 name: room.name(),
                 unread_notifications: unread.notification_count,
                 highlight_count: unread.highlight_count,
                 is_direct: room.direct_targets_length() > 0,
-            }
+                membership,
+            })
         })
         .collect();
 
@@ -3577,6 +3693,8 @@ mod tests {
         enable_recovery_result: Result<String, BackendError>,
         reset_recovery_result: Result<String, BackendError>,
         recover_secrets_result: Result<(), BackendError>,
+        accept_room_invite_result: Result<(), BackendError>,
+        reject_room_invite_result: Result<(), BackendError>,
         session: Option<MatrixSession>,
     }
 
@@ -3609,6 +3727,8 @@ mod tests {
                 enable_recovery_result: Ok("mock recovery key".to_owned()),
                 reset_recovery_result: Ok("mock reset recovery key".to_owned()),
                 recover_secrets_result: Ok(()),
+                accept_room_invite_result: Ok(()),
+                reject_room_invite_result: Ok(()),
                 session: Some(mock_session()),
             }
         }
@@ -3756,6 +3876,14 @@ mod tests {
             self.recover_secrets_result = recover_secrets_result;
             self
         }
+
+        fn with_reject_room_invite_result(
+            mut self,
+            reject_room_invite_result: Result<(), BackendError>,
+        ) -> Self {
+            self.reject_room_invite_result = reject_room_invite_result;
+            self
+        }
     }
 
     #[async_trait]
@@ -3875,6 +4003,16 @@ mod tests {
         async fn send_dm_text(&self, _user_id: &str, _body: &str) -> Result<String, BackendError> {
             self.record_call("send_dm_text");
             Ok("$mock-dm:example.org".to_owned())
+        }
+
+        async fn accept_room_invite(&self, _room_id: &str) -> Result<(), BackendError> {
+            self.record_call("accept_room_invite");
+            self.accept_room_invite_result.clone()
+        }
+
+        async fn reject_room_invite(&self, _room_id: &str) -> Result<(), BackendError> {
+            self.record_call("reject_room_invite");
+            self.reject_room_invite_result.clone()
         }
 
         async fn upload_media(
@@ -5314,6 +5452,7 @@ mod tests {
             unread_notifications: 0,
             highlight_count: 0,
             is_direct: false,
+            membership: RoomMembership::Joined,
         }]));
         let handle = spawn_runtime_with_backend(mock_backend.clone());
         let mut events = handle.subscribe();
@@ -5949,6 +6088,231 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_accept_room_invite_success_emits_ack_and_refreshes_room_list() {
+        let mock_backend = Arc::new(MockRuntimeBackend::new(vec![RoomSummary {
+            room_id: "!room:example.org".to_owned(),
+            name: Some("Mock Room".to_owned()),
+            unread_notifications: 0,
+            highlight_count: 0,
+            is_direct: false,
+            membership: RoomMembership::Joined,
+        }]));
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: None,
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::LoginPassword {
+                user_id_or_localpart: "@mock:example.org".to_owned(),
+                password: "password".to_owned(),
+            })
+            .await
+            .expect("login should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { success: true, .. })
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::AcceptRoomInvite {
+                room_id: "!room:example.org".to_owned(),
+                client_txn_id: "invite-txn-1".to_owned(),
+            })
+            .await
+            .expect("accept invite should enqueue");
+
+        let invite_ack = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::InviteActionAck(_))
+        })
+        .await;
+        match invite_ack {
+            BackendEvent::InviteActionAck(ack) => {
+                assert_eq!(ack.client_txn_id, "invite-txn-1");
+                assert_eq!(ack.room_id, "!room:example.org");
+                assert_eq!(ack.action, InviteAction::Accept);
+                assert_eq!(ack.error_code, None);
+            }
+            other => panic!("unexpected invite ack event: {other:?}"),
+        }
+
+        let room_list = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::RoomListUpdated { .. })
+        })
+        .await;
+        match room_list {
+            BackendEvent::RoomListUpdated { rooms } => {
+                assert_eq!(rooms.len(), 1);
+                assert_eq!(rooms[0].room_id, "!room:example.org");
+                assert_eq!(rooms[0].membership, RoomMembership::Joined);
+            }
+            other => panic!("unexpected room list event: {other:?}"),
+        }
+
+        assert_eq!(
+            mock_backend.calls_snapshot(),
+            vec!["login_password", "accept_room_invite", "list_rooms"]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reject_room_invite_failure_emits_ack_without_fatal_error() {
+        let mock_backend = Arc::new(
+            MockRuntimeBackend::new(Vec::new()).with_reject_room_invite_result(Err(
+                BackendError::new(
+                    BackendErrorCategory::Network,
+                    "invite_reject_failed",
+                    "temporary network issue",
+                ),
+            )),
+        );
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: None,
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::LoginPassword {
+                user_id_or_localpart: "@mock:example.org".to_owned(),
+                password: "password".to_owned(),
+            })
+            .await
+            .expect("login should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::AuthResult { success: true, .. })
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::RejectRoomInvite {
+                room_id: "!room:example.org".to_owned(),
+                client_txn_id: "invite-txn-2".to_owned(),
+            })
+            .await
+            .expect("reject invite should enqueue");
+
+        let invite_ack = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::InviteActionAck(_))
+        })
+        .await;
+        match invite_ack {
+            BackendEvent::InviteActionAck(ack) => {
+                assert_eq!(ack.client_txn_id, "invite-txn-2");
+                assert_eq!(ack.room_id, "!room:example.org");
+                assert_eq!(ack.action, InviteAction::Reject);
+                assert_eq!(ack.error_code.as_deref(), Some("invite_reject_failed"));
+            }
+            other => panic!("unexpected invite ack event: {other:?}"),
+        }
+
+        let fatal = time::timeout(
+            Duration::from_millis(200),
+            recv_matching_event(&mut events, |event| {
+                matches!(event, BackendEvent::FatalError { .. })
+            }),
+        )
+        .await;
+        assert!(fatal.is_err(), "invite failures should not emit FatalError");
+
+        assert_eq!(
+            mock_backend.calls_snapshot(),
+            vec!["login_password", "reject_room_invite"]
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_invite_action_invalid_state_emits_ack_without_fatal_error() {
+        let mock_backend = Arc::new(MockRuntimeBackend::new(Vec::new()));
+        let handle = spawn_runtime_with_backend(mock_backend.clone());
+        let mut events = handle.subscribe();
+
+        handle
+            .send(BackendCommand::Init {
+                homeserver: "https://matrix.example.org".to_owned(),
+                data_dir: PathBuf::from("./.unused-test-store"),
+                config: None,
+            })
+            .await
+            .expect("init should enqueue");
+        let _ = recv_matching_event(&mut events, |event| {
+            matches!(
+                event,
+                BackendEvent::StateChanged {
+                    state: BackendLifecycleState::Configured
+                }
+            )
+        })
+        .await;
+
+        handle
+            .send(BackendCommand::AcceptRoomInvite {
+                room_id: "!room:example.org".to_owned(),
+                client_txn_id: "invite-txn-3".to_owned(),
+            })
+            .await
+            .expect("accept invite should enqueue");
+
+        let invite_ack = recv_matching_event(&mut events, |event| {
+            matches!(event, BackendEvent::InviteActionAck(_))
+        })
+        .await;
+        match invite_ack {
+            BackendEvent::InviteActionAck(ack) => {
+                assert_eq!(ack.client_txn_id, "invite-txn-3");
+                assert_eq!(ack.action, InviteAction::Accept);
+                assert_eq!(ack.error_code.as_deref(), Some("invalid_state_transition"));
+            }
+            other => panic!("unexpected invite ack event: {other:?}"),
+        }
+
+        let fatal = time::timeout(
+            Duration::from_millis(200),
+            recv_matching_event(&mut events, |event| {
+                matches!(event, BackendEvent::FatalError { .. })
+            }),
+        )
+        .await;
+        assert!(
+            fatal.is_err(),
+            "invite validation failures should not emit FatalError"
+        );
+
+        assert!(mock_backend.calls_snapshot().is_empty());
+    }
+
+    #[tokio::test]
     async fn runtime_restore_session_without_persisted_session_reports_auth_error() {
         let mock_backend = Arc::new(MockRuntimeBackend::new(Vec::new()));
         let handle = spawn_runtime_with_backend(mock_backend.clone());
@@ -6219,6 +6583,7 @@ mod tests {
             unread_notifications: 0,
             highlight_count: 0,
             is_direct: false,
+            membership: RoomMembership::Joined,
         }]));
         let runtime = spawn_runtime_with_backend(mock_backend.clone());
         let adapter = MatrixFrontendAdapter::new(runtime);
