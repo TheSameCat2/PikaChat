@@ -46,7 +46,7 @@ PikaChat is now in an early but functional desktop MVP phase:
 - [x] Matrix Backend Runtime
 - [x] Basic Sign In/Out
 - [x] Room List/Timeline Rendering
-  - [ ] Room Names/Group Names
+  - [x] Room Names/Group Names
 - [x] Timeline Pagination
 - [x] Timeline Event Rendering
 - [x] Plain-Text Message Send
@@ -55,7 +55,7 @@ PikaChat is now in an early but functional desktop MVP phase:
 
 ### Phase 2
 
-- [ ] Media Upload/Download (Images)
+- [x] Media Upload/Download (Images)
 - [ ] Media Upload/Download (Video)
 - [ ] Reactions
 - [ ] Voice Channels
