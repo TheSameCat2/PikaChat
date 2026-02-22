@@ -31,7 +31,7 @@ use backend_core::{
 };
 use backend_platform::{OsKeyringSecretStore, ScopedSecretStore, SecretStoreError};
 use matrix_sdk::{
-    Client, ClientBuildError, HttpError, RoomState,
+    Client, ClientBuildError, HttpError, RoomDisplayName, RoomState,
     authentication::matrix::MatrixSession,
     config::RequestConfig,
     config::SyncSettings,
@@ -181,8 +181,8 @@ impl MatrixBackend {
     }
 
     /// Collect room summaries from the current client state.
-    pub fn list_rooms(&self) -> Vec<RoomSummary> {
-        collect_room_summaries(&self.client)
+    pub async fn list_rooms(&self) -> Vec<RoomSummary> {
+        collect_room_summaries(&self.client).await
     }
 
     /// Login with password using the Matrix client API.
@@ -282,7 +282,7 @@ impl MatrixBackend {
                                         ops,
                                     });
                                 }
-                                let rooms = collect_room_summaries(&client);
+                                let rooms = collect_room_summaries(&client).await;
                                 debug!(room_count = rooms.len(), "emitting room list after sync");
                                 let _ = event_tx_clone.send(BackendEvent::RoomListUpdated { rooms });
 
@@ -711,7 +711,7 @@ trait RuntimeBackend: Send + Sync {
     fn session(&self) -> Option<MatrixSession>;
     async fn restore_session(&self, session: MatrixSession) -> Result<(), BackendError>;
     async fn logout(&self) -> Result<(), BackendError>;
-    fn list_rooms(&self) -> Vec<RoomSummary>;
+    async fn list_rooms(&self) -> Vec<RoomSummary>;
     async fn login_password(
         &self,
         user_id_or_localpart: &str,
@@ -793,8 +793,8 @@ impl RuntimeBackend for MatrixBackend {
         MatrixBackend::logout(self).await
     }
 
-    fn list_rooms(&self) -> Vec<RoomSummary> {
-        MatrixBackend::list_rooms(self)
+    async fn list_rooms(&self) -> Vec<RoomSummary> {
+        MatrixBackend::list_rooms(self).await
     }
 
     async fn login_password(
@@ -1328,7 +1328,7 @@ impl MatrixRuntime {
             }
             BackendCommand::StartSync => self.handle_start_sync().await,
             BackendCommand::StopSync => self.handle_stop_sync().await,
-            BackendCommand::ListRooms => self.handle_list_rooms(),
+            BackendCommand::ListRooms => self.handle_list_rooms().await,
             BackendCommand::AcceptRoomInvite {
                 room_id,
                 client_txn_id,
@@ -1885,11 +1885,11 @@ impl MatrixRuntime {
         Ok(())
     }
 
-    fn handle_list_rooms(&mut self) -> Result<(), BackendError> {
+    async fn handle_list_rooms(&mut self) -> Result<(), BackendError> {
         debug!("handling ListRooms command");
         let (_candidate, _events) = self.validate_transition(BackendCommand::ListRooms)?;
         let backend = self.require_backend()?;
-        let rooms = backend.list_rooms();
+        let rooms = backend.list_rooms().await;
         debug!(room_count = rooms.len(), "emitting RoomListUpdated");
         self.channels.emit(BackendEvent::RoomListUpdated { rooms });
         Ok(())
@@ -1959,7 +1959,7 @@ impl MatrixRuntime {
             }));
 
         if error_code.is_none() {
-            let rooms = backend.list_rooms();
+            let rooms = backend.list_rooms().await;
             self.channels.emit(BackendEvent::RoomListUpdated { rooms });
         }
     }
@@ -3739,27 +3739,71 @@ fn apply_timeline_ops_lenient(buffer: &mut TimelineBuffer, ops: &[TimelineOp]) {
     }
 }
 
-fn collect_room_summaries(client: &Client) -> Vec<RoomSummary> {
-    let mut rooms: Vec<RoomSummary> = client
-        .rooms()
-        .into_iter()
-        .filter_map(|room| {
-            let membership = match room.state() {
-                RoomState::Joined => RoomMembership::Joined,
-                RoomState::Invited => RoomMembership::Invited,
-                _ => return None,
-            };
-            let unread = room.unread_notification_counts();
-            Some(RoomSummary {
-                room_id: room.room_id().to_string(),
-                name: room.name(),
-                unread_notifications: unread.notification_count,
-                highlight_count: unread.highlight_count,
-                is_direct: room.direct_targets_length() > 0,
-                membership,
-            })
-        })
-        .collect();
+fn normalize_room_summary_name(name: Option<String>) -> Option<String> {
+    name.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_owned())
+        }
+    })
+}
+
+fn room_display_name_to_summary_name(display_name: RoomDisplayName) -> Option<String> {
+    match display_name {
+        RoomDisplayName::Named(value)
+        | RoomDisplayName::Aliased(value)
+        | RoomDisplayName::Calculated(value)
+        | RoomDisplayName::EmptyWas(value) => normalize_room_summary_name(Some(value)),
+        RoomDisplayName::Empty => None,
+    }
+}
+
+fn choose_room_summary_name(
+    explicit_name: Option<String>,
+    display_name: Option<RoomDisplayName>,
+) -> Option<String> {
+    normalize_room_summary_name(explicit_name)
+        .or_else(|| display_name.and_then(room_display_name_to_summary_name))
+}
+
+async fn resolve_room_summary_name(room: &matrix_sdk::Room) -> Option<String> {
+    if let Some(name) = choose_room_summary_name(room.name(), room.cached_display_name()) {
+        return Some(name);
+    }
+
+    match room.display_name().await {
+        Ok(display_name) => room_display_name_to_summary_name(display_name),
+        Err(error) => {
+            warn!(
+                room_id = %room.room_id(),
+                ?error,
+                "failed to compute room display name"
+            );
+            None
+        }
+    }
+}
+
+async fn collect_room_summaries(client: &Client) -> Vec<RoomSummary> {
+    let mut rooms: Vec<RoomSummary> = Vec::new();
+    for room in client.rooms() {
+        let membership = match room.state() {
+            RoomState::Joined => RoomMembership::Joined,
+            RoomState::Invited => RoomMembership::Invited,
+            _ => continue,
+        };
+        let unread = room.unread_notification_counts();
+        rooms.push(RoomSummary {
+            room_id: room.room_id().to_string(),
+            name: resolve_room_summary_name(&room).await,
+            unread_notifications: unread.notification_count,
+            highlight_count: unread.highlight_count,
+            is_direct: room.direct_targets_length() > 0,
+            membership,
+        });
+    }
 
     rooms.sort_by(|a, b| a.room_id.cmp(&b.room_id));
     rooms
@@ -4356,7 +4400,7 @@ mod tests {
             self.logout_result.clone()
         }
 
-        fn list_rooms(&self) -> Vec<RoomSummary> {
+        async fn list_rooms(&self) -> Vec<RoomSummary> {
             self.record_call("list_rooms");
             self.rooms.clone()
         }
@@ -4584,6 +4628,41 @@ mod tests {
         let err = parse_media_content_type("bad-content-type")
             .expect_err("invalid media content type must fail");
         assert_eq!(err.code, "invalid_media_content_type");
+    }
+
+    #[test]
+    fn normalize_room_summary_name_trims_and_ignores_empty() {
+        assert_eq!(
+            normalize_room_summary_name(Some("  Team Chat  ".to_owned())),
+            Some("Team Chat".to_owned())
+        );
+        assert_eq!(normalize_room_summary_name(Some("   ".to_owned())), None);
+        assert_eq!(normalize_room_summary_name(None), None);
+    }
+
+    #[test]
+    fn choose_room_summary_name_prefers_explicit_name() {
+        let chosen = choose_room_summary_name(
+            Some("  Explicit Room  ".to_owned()),
+            Some(RoomDisplayName::Calculated("Other User".to_owned())),
+        );
+        assert_eq!(chosen.as_deref(), Some("Explicit Room"));
+    }
+
+    #[test]
+    fn room_display_name_to_summary_name_handles_empty_variants() {
+        assert_eq!(
+            room_display_name_to_summary_name(RoomDisplayName::Calculated("Alice, Bob".to_owned())),
+            Some("Alice, Bob".to_owned())
+        );
+        assert_eq!(
+            room_display_name_to_summary_name(RoomDisplayName::EmptyWas("  Bob  ".to_owned())),
+            Some("Bob".to_owned())
+        );
+        assert_eq!(
+            room_display_name_to_summary_name(RoomDisplayName::Empty),
+            None
+        );
     }
 
     #[test]

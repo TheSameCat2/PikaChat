@@ -1346,9 +1346,19 @@ mod tests {
         highlight: u64,
         membership: RoomMembership,
     ) -> RoomSummary {
+        room_with_name(room_id, Some(name), unread, highlight, membership)
+    }
+
+    fn room_with_name(
+        room_id: &str,
+        name: Option<&str>,
+        unread: u64,
+        highlight: u64,
+        membership: RoomMembership,
+    ) -> RoomSummary {
         RoomSummary {
             room_id: room_id.to_owned(),
-            name: Some(name.to_owned()),
+            name: name.map(ToOwned::to_owned),
             unread_notifications: unread,
             highlight_count: highlight,
             is_direct: false,
@@ -1398,6 +1408,25 @@ mod tests {
         assert_eq!(snapshot.rooms[2].unread_notifications, 2);
         assert_eq!(snapshot.rooms[2].highlight_count, 1);
         assert_eq!(snapshot.rooms[3].room_id, "!joined-1:example.org");
+    }
+
+    #[test]
+    fn room_list_falls_back_to_room_id_when_name_is_missing_or_blank() {
+        let mut state = DesktopState::new("@alice:example.org", 50);
+        state.replace_rooms(vec![
+            room_with_name("!none:example.org", None, 0, 0, RoomMembership::Joined),
+            room_with_name(
+                "!blank:example.org",
+                Some("   "),
+                0,
+                0,
+                RoomMembership::Joined,
+            ),
+        ]);
+
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.rooms[0].display_name, "!none:example.org");
+        assert_eq!(snapshot.rooms[1].display_name, "!blank:example.org");
     }
 
     #[test]
